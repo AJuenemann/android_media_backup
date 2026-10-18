@@ -75,12 +75,40 @@ Auf diesem Rechner ist der Menüeintrag mit diesem Backup-Icon bereits eingerich
 
 1. Auf dem Smartphone Entwickleroptionen und USB-Debugging aktivieren.
 2. Per USB verbinden, entsperren und den Computer für USB-Debugging autorisieren.
-3. Anwendung starten, **Geräte suchen** und das autorisierte Gerät auswählen.
+3. Anwendung starten. Geräte werden automatisch gesucht und das erste autorisierte
+   Gerät ausgewählt. Bei Bedarf **Geräte suchen** oder ein anderes Gerät auswählen.
 4. Einen eigenen Backup-Zielordner auswählen.
-5. **Bestand einlesen**: Anzahl, Datenmenge, Speicher und Zugriffsfehler prüfen.
+5. Der Bestand wird automatisch eingelesen. Anzahl, Datenmenge, Speicher und
+   Hinweise in der Vorschau prüfen. **Bestand neu einlesen** wiederholt die Erfassung.
 6. **Sicherung starten** und Ziel bestätigen.
-7. Abschlussbericht prüfen. Nur „Vollständig im erfassten, zugänglichen Umfang“
+7. Die Ergebnis-Karte prüfen. Nur „Vollständig im erfassten, zugänglichen Umfang“
    bedeutet, dass alle erfassten Dateien ohne gemeldete Probleme gesichert wurden.
+
+Das Dashboard ordnet Gerät, Ziel und Vorschau in Karten. Es folgt automatisch dem
+hellen oder dunklen Farbschema des Systems, auch bei einem Wechsel während der
+Laufzeit. Die Oberfläche benötigt keine zusätzlichen Design-Pakete.
+
+Während einer Gerätesuche, Bestandsaufnahme oder Sicherung wird der Startknopf zu
+**Abbrechen**. Der Fortschrittsbereich zeigt Phase, Dateizähler und Laufzeit.
+Lange Dateinamen werden gekürzt; der vollständige Pfad steht im Tooltip.
+Geräteauswahl, Ziel und Prüfmodus sind während eines Vorgangs gesperrt.
+Ein Gerätewechsel verwirft die alte Vorschau und liest den neuen Bestand ein.
+Nach einer abgeschlossenen Sicherung wird der Bestand automatisch erneut erfasst;
+das Ergebnis der Sicherung bleibt dabei sichtbar. Nach Abbruch oder gestopptem
+Backup gibt es keinen automatischen neuen Versuch; bei Bedarf **Bestand neu
+einlesen** wählen. Eine Sicherung startet nie automatisch.
+
+Die Zielkarte vergleicht freien Speicherplatz mit dem Platzbedarf einer
+vollständigen neuen Kopie einschließlich 16 MiB Reserve. Dies ist eine vorsichtige
+Schätzung: Bereits vorhandene Dateien können den tatsächlichen Bedarf reduzieren.
+Ein wiederhergestellter Zielpfad garantiert nicht, dass ein externer Datenträger
+eingehängt ist; den Zielordner vor dem Start prüfen.
+
+Fehler erscheinen als sichtbare Mitteilung statt als blockierender Fehlerdialog.
+Hinweise zu fehlender Gerätefreigabe stehen direkt in der Gerätekarte. Details
+der Bestandsaufnahme sowie das **Technische Protokoll** sind aufklappbar.
+**Protokoll kopieren** übernimmt den vollständigen Text mit Zeitstempeln in die
+Zwischenablage. **Info** erklärt Umfang, Ausschlüsse und Integritätsprüfung.
 
 Der zuletzt gewählte Backup-Ordner wird benutzerspezifisch gespeichert und beim
 nächsten Start automatisch eingesetzt. Dies gilt auch für manuell eingegebene
@@ -103,6 +131,14 @@ Die Ergebnisanzeige unterscheidet ausdrücklich:
   Ersatzregel (Datei-Änderungsdatum, sonst `Unbekannt`).
 - **Leere Quelldateien:** Die Datei hatte bereits auf dem Smartphone 0 Byte.
   Ihre erfolgreiche Kopie enthält deshalb keine nutzbaren Bild-/Videodaten.
+
+Die Ergebnis-Karte zeigt neue, bereits vorhandene, fehlgeschlagene und nicht
+bearbeitete Dateien als getrennte Kennzahlen. Fehler, leere Quelldateien und
+Metadatenwarnungen sind in eigenen aufklappbaren Gruppen aufgelistet.
+Prüfmodus und Anzahl ohne erneute Inhaltsprüfung übersprungener Dateien bleiben
+auch bei eingeklappten Details sichtbar. Farbe wird immer durch einen
+ausgeschriebenen Status ergänzt. **Berichtsordner anzeigen** öffnet den Ordner
+des angezeigten JSON-Berichts im Dateimanager.
 
 Bei ausschließlich solchen Warnungen lautet der Status
 **„Alle ausgewählten Dateien gesichert – mit Warnungen“**, nicht „fehlgeschlagen“.
@@ -303,6 +339,9 @@ Metadaten, ADB-Shell-Quoting, Sonderzeichen, beschädigte Backups, vollen Speich
 Parallelzugriff, Abbruch und den GUI-Ablauf mit simuliertem Smartphone.
 GUI-Tests verwenden Qt im Offscreen-Modus. Echte ExifTool-Integrationstests laufen
 nur, wenn das Programm verfügbar ist; sonst werden sie ausdrücklich übersprungen.
+Die GUI-Tests prüfen auch automatisches Einlesen bei Start und Gerätewechsel,
+erneute Erfassung nach einer Sicherung, Abbruch ohne automatische Wiederholung,
+Inline-Fehler, aufklappbare Ergebnisdetails, Speicherwarnungen und Theme-Wechsel.
 
 Zusätzlich am echten Gerät prüfen: Erkennung des internen Speichers und der
 SD-Karte, Bilder/Videos über einen Jahreswechsel, Messenger-Dateien, gesperrte
