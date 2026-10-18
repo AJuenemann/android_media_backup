@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Android-Medienbackup
+Comment=Android-Dateien lokal nach Typ und Jahr sichern
+Exec=android-backup
+Icon=android-media-backup
+Terminal=false
+Categories=Utility;Archiving;
+Keywords=Android;Backup;Sicherung;Fotos;Videos;
+StartupNotify=true

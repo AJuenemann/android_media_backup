@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "android-media-backup"
+version = "0.1.0"
+description = "Local, verified and additive Android media backup for Linux"
+requires-python = ">=3.11"
+dependencies = ["PySide6-Essentials>=6.8,<7"]
+
+[project.scripts]
+android-backup = "android_backup.gui:main"
+
+[tool.setuptools.packages.find]
+include = ["android_backup*"]
+
+[tool.setuptools.package-data]
+android_backup = ["backup.svg"]
