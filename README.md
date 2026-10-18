@@ -108,10 +108,10 @@ Während einer Gerätesuche, Bestandsaufnahme oder Sicherung wird der Startknopf
 Lange Dateinamen werden gekürzt; der vollständige Pfad steht im Tooltip.
 Geräteauswahl, Ziel und Prüfmodus sind während eines Vorgangs gesperrt.
 Ein Gerätewechsel verwirft die alte Vorschau und liest den neuen Bestand ein.
-Nach einer abgeschlossenen Sicherung wird der Bestand automatisch erneut erfasst;
-das Ergebnis der Sicherung bleibt dabei sichtbar. Nach Abbruch oder gestopptem
-Backup gibt es keinen automatischen neuen Versuch; bei Bedarf **Bestand neu
-einlesen** wählen. Eine Sicherung startet nie automatisch.
+Nach einer Sicherung bleibt das Ergebnis sichtbar, ohne den Bestand automatisch
+erneut einzulesen. Für eine weitere Sicherung zuerst **Bestand neu einlesen**
+wählen; die alte Vorschau wird nicht erneut verwendet. Das gilt auch nach Abbruch
+oder gestopptem Backup. Eine Sicherung startet nie automatisch.
 
 Die Zielkarte vergleicht freien Speicherplatz mit dem Platzbedarf einer
 vollständigen neuen Kopie einschließlich 16 MiB Reserve. Dies ist eine vorsichtige
@@ -154,6 +154,35 @@ Die Ergebnisanzeige unterscheidet ausdrücklich:
 - **Leere Quelldateien:** Die Datei hatte bereits auf dem Smartphone 0 Byte.
   Ihre erfolgreiche Kopie enthält deshalb keine nutzbaren Bild-/Videodaten.
 
+In **Probleme anzeigen** lassen sich leere Quelldateien einzeln auswählen.
+Der vollständige Dateiname wird separat mit Zeilenumbruch angezeigt, damit er
+auf dem Smartphone verglichen oder in der Dateimanager-Suche eingegeben werden kann.
+In den Dateidetails zusätzlich prüfen, ob die Datei weiterhin 0 Byte groß ist.
+**Ordner auf Smartphone öffnen** öffnet den enthaltenden Ordner im Android-Dateimanager
+des passenden, autorisierten Quellgeräts. Das Smartphone muss entsperrt sein.
+Die Aktion markiert die Datei nicht automatisch und verändert keine Dateien.
+Nicht jeder Android-Dateimanager unterstützt diesen Aufruf; fehlende Unterstützung
+oder eine nicht bestätigte Öffnung werden als Fehler angezeigt. In diesem Fall
+anhand des angezeigten Pfads manuell zum Ordner navigieren. Der Smartphone-Pfad
+ist keine Browser-Adresse und lässt sich nicht im Browser des Rechners öffnen.
+**Auf Smartphone löschen …** ist eine zusätzliche, ausdrücklich destruktive
+Aufräumaktion, keine Reparatur: Nach einer separaten Bestätigung wird genau die
+ausgewählte leere Datei auf dem Quellgerät endgültig gelöscht, ohne Papierkorb.
+Die Standardauswahl ist **Abbrechen**. Backups und historische Berichte werden
+nicht verändert; die Vorschau wird nach erfolgreichem Löschen verworfen.
+
+Die App verlangt dasselbe autorisierte Quellgerät wie im Bericht und prüft direkt
+vor dem Löschen erneut, ob der Pfad im erfassten gemeinsamen Speicher liegt und
+eine reguläre Datei mit 0 Byte bezeichnet. Fehlende, nicht mehr leere Dateien,
+Verzeichnisse und symbolische Links (auch in übergeordneten Pfaden) werden
+abgelehnt. Während anderer Vorgänge kann nicht gelöscht werden. Fehler werden
+sichtbar gemeldet; ein Bericht allein ist kein Nachweis, dass die Datei noch leer
+ist. **Wichtig:** Android bietet hier kein atomares „nur löschen, wenn weiterhin
+leer“. Zwischen Prüfung und Löschen bleibt ein kurzes Zeitfenster. AyuGram und
+andere Apps, die den Anhang erneut herunterladen oder schreiben, währenddessen
+nicht verwenden. Im Zweifel nicht löschen, sondern den Anhang erneut herunterladen
+und anschließend **Bestand neu einlesen**.
+
 Die Ergebnis-Karte zeigt neue, bereits vorhandene, fehlgeschlagene und nicht
 bearbeitete Dateien als getrennte Kennzahlen. Fehler, leere Quelldateien und
 Metadatenwarnungen sind in eigenen aufklappbaren Gruppen aufgelistet.
@@ -165,8 +194,10 @@ Sie unterscheidet fehlgeschlagene oder nicht bearbeitete Dateien, Erfassungsfehl
 leere Quelldateien und Metadatenwarnungen. Bekannte Warnungen erklären etwa eine
 abweichende Jahresablage, mögliche Farbabweichungen oder unlesbare EXIF-Texte.
 Unbekannte Meldungen bleiben unverändert sichtbar, ohne eine ungesicherte Ursache
-zu behaupten. Auch ohne Probleme lässt sich die Übersicht öffnen; sie bestätigt
-dann ausdrücklich nur den erfassten, zugänglichen Umfang.
+zu behaupten. Ohne gemeldete Probleme ist der Button deaktiviert und zeigt
+**Keine Probleme festgestellt**. Diese Aussage gilt nur für den erfassten,
+zugänglichen Umfang; im Schnelllauf übersprungene Dateien wurden nicht erneut
+auf Inhaltsgleichheit geprüft.
 
 Bei ausschließlich solchen Warnungen lautet der Status
 **„Alle ausgewählten Dateien gesichert – mit Warnungen“**, nicht „fehlgeschlagen“.
@@ -241,7 +272,9 @@ Es gibt keine Monat-, Tag- oder App-Unterordner.
 
 ## Datenintegrität und wiederholte Sicherungen
 
-- Die Quelle wird ausschließlich gelesen. Am Ziel werden keine Nutzdateien gelöscht.
+- Die Sicherung liest die Quelle ausschließlich. Am Ziel werden keine Nutzdateien
+  gelöscht. Die separat bestätigte Aufräumaktion für leere Quelldateien in der
+  Problemübersicht ist die einzige Ausnahme für Löschungen auf dem Smartphone.
 - Jede neue Datei wird zunächst im Ziel unter `.backup/staging-<ID>` übertragen.
 - Quellgröße, Änderungszeit und SHA-256 werden vor und nach dem Transfer geprüft;
   die lokale Kopie muss ebenfalls mit der Quellprüfsumme übereinstimmen.
@@ -371,7 +404,7 @@ Parallelzugriff, Abbruch und den GUI-Ablauf mit simuliertem Smartphone.
 GUI-Tests verwenden Qt im Offscreen-Modus. Echte ExifTool-Integrationstests laufen
 nur, wenn das Programm verfügbar ist; sonst werden sie ausdrücklich übersprungen.
 Die GUI-Tests prüfen auch automatisches Einlesen bei Start und Gerätewechsel,
-erneute Erfassung nach einer Sicherung, Abbruch ohne automatische Wiederholung,
+keine automatische Neuerfassung nach einer Sicherung, Abbruch ohne automatische Wiederholung,
 Inline-Fehler, aufklappbare Ergebnisdetails, Speicherwarnungen und Theme-Wechsel.
 Unbehandelte Ausnahmen in Qt-Rückrufen lassen die Tests fehlschlagen. Testfenster,
 Hintergrundvorgänge und simulierte Abhängigkeiten werden auch bei einem Fehler im

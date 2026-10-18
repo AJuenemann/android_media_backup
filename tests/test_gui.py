@@ -106,8 +106,11 @@ class GuiTests(unittest.TestCase):
             self.assertTrue((Path(folder) / "Fotos/2023/a.jpg").is_file())
             self.assertIn("Neu gesichert: 2; bereits vorhanden: 1", self.window.log.toPlainText())
             self.assertIn("Vollständig im erfassten", self.window.result_status.text())
+            self.assertFalse(self.window.start.isEnabled())
+            self.assertIsNone(self.window.inventory)
+            self.window.scan.click()
+            self.wait(lambda: self.window.worker is None)
             self.assertTrue(self.window.start.isEnabled())
-            self.assertIsNotNone(self.window.inventory)
             self.window.start_backup()
             self.wait(lambda: self.window.worker is None)
             self.assertIn("Neu gesichert: 0; bereits vorhanden: 3", self.window.log.toPlainText())
@@ -275,6 +278,18 @@ class GuiTests(unittest.TestCase):
         self.assertTrue(self.window.progress_card.isHidden())
         self.assertIn("Verbunden", self.window.device_status.text())
 
+    def test_startup_with_remembered_target_enables_backup_after_scan(self):
+        self.window.target.setText(self.settings_directory.name)
+        self.window.save_target()
+        self.cleanup_window()
+        self.window = Window()
+        self.window.show()
+        self.wait(lambda: self.window.inventory is not None and self.window.worker is None)
+        self.window.device_timer.stop()
+        self.assertEqual(self.window.target.text(), self.settings_directory.name)
+        self.assertTrue(self.window.start.isEnabled())
+        self.assertEqual(self.window.start.text(), "Sicherung s&tarten")
+
     def test_refresh_scans_only_first_authorized_device_once(self):
         devices = [
             Device("locked", "unauthorized", "Locked"),
@@ -402,12 +417,50 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(self.app.clipboard().text(), self.window.log.toPlainText())
 
     def test_problem_button_opens_report_without_requiring_report_file(self):
-        report = Report("phone", [], report_path="/tmp/backup/.backup/report.json", status="complete")
+        report = Report(
+            "phone", [], report_path="/tmp/backup/.backup/report.json",
+            status="warnings", empty_files=["/empty.jpg"],
+        )
         self.window.show_report(report)
-        with patch("android_backup.gui.ProblemsDialog", autospec=True) as dialog:
+        dialogs = []
+
+        def execute(dialog):
+            dialogs.append(dialog)
+            return QDialog.DialogCode.Accepted
+
+        with patch("android_backup.gui.ProblemsDialog.exec", new=execute):
             self.window.report_problems.click()
-        dialog.assert_called_once_with(self.window, report)
-        dialog.return_value.exec.assert_called_once()
+        self.assertEqual(len(dialogs), 1)
+        dialog = dialogs[0]
+        self.assertIsInstance(dialog, ProblemsDialog)
+        self.assertIn("/empty.jpg", dialog.problems.toPlainText())
+        self.assertIs(self.window.report, report)
+
+    def test_problem_button_matches_report_details_and_resets_for_clean_reports(self):
+        cases = [
+            {"errors": ["Erfassung unvollständig"]},
+            {"failed": 1, "total": 1},
+            {"total": 1},
+            {"empty_files": ["/empty.jpg"]},
+            {"metadata_warnings": {"/photo.jpg": ["EXIF-Warnung"]}},
+            {"status": "cancelled"},
+            {"status": "failed"},
+            {"status": "running"},
+        ]
+        for fields in cases:
+            with self.subTest(fields=fields):
+                self.window.show_report(Report("phone", [], **fields))
+                self.assertTrue(self.window.report_problems.isEnabled())
+                self.assertEqual(self.window.report_problems.text(), "&Probleme anzeigen")
+                self.window.show_report(Report(
+                    "phone", [], status="complete", total=2, saved=1, existing=1,
+                    verification="quick", quick_skipped=1,
+                ))
+                self.assertFalse(self.window.report_problems.isEnabled())
+                self.assertEqual(self.window.report_problems.text(), "Keine Probleme festgestellt")
+                with patch("android_backup.gui.ProblemsDialog.exec") as execute:
+                    self.window.report_problems.click()
+                execute.assert_not_called()
 
     def test_problem_overview_lists_each_message_path_and_impact(self):
         report = Report(
@@ -447,7 +500,7 @@ class GuiTests(unittest.TestCase):
                 dialog.deleteLater()
 
     def test_log_toggle_scrolls_and_focuses_then_restores_previous_area(self):
-        self.window.show_report(Report("phone", [], status="complete"))
+        self.window.show_report(Report("phone", [], status="warnings", empty_files=["/empty.jpg"]))
         self.window.resize(760, 600)
         self.app.processEvents()
         self.window.dashboard_scroll.verticalScrollBar().setValue(0)
@@ -466,6 +519,13 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(self.window.dashboard_scroll.verticalScrollBar().value(), original_scroll)
 
     def test_log_collapse_without_report_returns_to_scan(self):
+        self.window.log_section.toggle.click()
+        self.wait(lambda: self.app.focusWidget() == self.window.log)
+        self.window.log_section.toggle.click()
+        self.wait(lambda: self.app.focusWidget() == self.window.scan)
+
+    def test_log_collapse_with_clean_report_skips_disabled_problem_button(self):
+        self.window.show_report(Report("phone", [], status="complete"))
         self.window.log_section.toggle.click()
         self.wait(lambda: self.app.focusWidget() == self.window.log)
         self.window.log_section.toggle.click()
@@ -501,9 +561,9 @@ class GuiTests(unittest.TestCase):
         dialog.close()
         dialog.deleteLater()
 
-    def test_backup_rescans_only_after_a_completed_run(self):
+    def test_backup_never_rescans_automatically_after_a_run(self):
         self.window.target.setText(self.settings_directory.name)
-        for status, expected_scans in (("complete", 1), ("cancelled", 0), ("failed", 0)):
+        for status in ("complete", "warnings", "issues", "cancelled", "failed"):
             with self.subTest(status=status):
                 self.window.inventory = Inventory("phone", [], [])
                 self.scan_mock.reset_mock()
@@ -515,9 +575,18 @@ class GuiTests(unittest.TestCase):
                     backup.return_value.run.return_value = report
                     self.window.start_backup()
                     self.wait(lambda: self.window.worker is None)
-                self.assertEqual(self.scan_mock.call_count, expected_scans)
+                self.scan_mock.assert_not_called()
                 self.assertEqual(self.window.result_status.text(), report.outcome)
-                self.assertEqual(self.window.inventory is not None, bool(expected_scans))
+                self.assertIsNone(self.window.inventory)
+                self.assertFalse(self.window.start.isEnabled())
+                self.assertTrue(self.window.scan.isEnabled())
+                self.assertFalse(self.window.pending_scan)
+                with patch("android_backup.gui.Adb.devices", return_value=[
+                    self.window.devices.currentData()
+                ]):
+                    self.window.poll_devices()
+                    self.wait(lambda: self.window.device_monitor is None)
+                self.scan_mock.assert_not_called()
 
     def test_small_window_uses_stacked_cards_without_horizontal_overflow(self):
         self.window.show_report(Report(
@@ -792,7 +861,7 @@ class GuiTests(unittest.TestCase):
                 self.app.processEvents()
                 text = "\n".join(item.text() for item in dialog.findChildren(QLabel))
                 for expected in (
-                    "Über die Sicherung", "nicht gelöscht", "Files by Google",
+                    "Über die Sicherung", "löscht keine Quelldateien", "Files by Google",
                     "Gesperrte Bereiche", "Cache", "keine Inhaltsgleichheit",
                     "vollständige Integritätsprüfung",
                 ):
@@ -848,6 +917,199 @@ class GuiTests(unittest.TestCase):
         self.assertIs(self.window.report, previous)
         self.assertTrue(self.window.banner.isVisible())
         self.assertIn("Bericht konnte nicht gelesen werden", self.window.banner.message.text())
+
+    def test_empty_source_actions_show_full_filename_and_explicit_folder_button(self):
+        path = "/storage/emulated/0/Download/AyuGram/Saved Attachments/-123#1320x1995@photo.jpg"
+        long_name = "<photo>&" + "1234567890" * 20 + ".jpg"
+        dialog = ProblemsDialog(self.window, Report(
+            "phone", [], empty_files=[path, "/storage/emulated/0/" + long_name], status="warnings"
+        ))
+        self.addCleanup(dialog.deleteLater)
+        self.assertEqual(dialog.source_name.toPlainText(), "-123#1320x1995@photo.jpg")
+        dialog.empty_files.setCurrentIndex(1)
+        self.assertEqual(dialog.source_name.toPlainText(), long_name)
+        self.assertEqual(dialog.open_source.text(), "&Ordner auf Smartphone öffnen")
+        self.assertFalse(any("kopieren" in button.text() for button in dialog.findChildren(QPushButton)))
+        dialog.set_deletion_busy(True)
+        self.assertFalse(dialog.delete_source.isEnabled())
+        self.assertFalse(dialog.open_source.isEnabled())
+        dialog.show()
+        self.app.processEvents()
+        self.assertEqual(dialog.source_name.horizontalScrollBar().maximum(), 0)
+        self.assertLessEqual(dialog.width(), 900)
+        QTest.keyClick(dialog, Qt.Key.Key_Escape)
+        self.assertTrue(dialog.isVisible())
+        dialog.set_deletion_busy(False)
+        dialog.close()
+
+    def test_empty_source_deletion_requires_matching_device_and_explicit_confirmation(self):
+        path = "/storage/emulated/0/Download/empty.jpg"
+        for serial, answer in (("other-phone", QDialog.DialogCode.Accepted),
+                               ("phone", QDialog.DialogCode.Rejected)):
+            with self.subTest(serial=serial):
+                report = Report(serial, ["/storage/emulated/0"], empty_files=[path], status="warnings")
+                self.window.report = report
+                dialog = ProblemsDialog(self.window, report)
+                self.addCleanup(dialog.deleteLater)
+                with patch("android_backup.gui.ConfirmationDialog.exec", return_value=answer), patch(
+                    "android_backup.gui.Adb.delete_empty_file"
+                ) as delete:
+                    self.window.delete_empty_source(dialog, path)
+                delete.assert_not_called()
+                self.assertIsNone(self.window.worker)
+                if serial != "phone":
+                    self.assertIn("Quellgerät", dialog.action_status.text())
+
+    def test_empty_source_deletion_success_keeps_historical_report_and_invalidates_inventory(self):
+        path = "/storage/emulated/0/Download/empty.jpg"
+        report = Report("phone", ["/storage/emulated/0"], empty_files=[path], status="warnings")
+        self.window.show_report(report)
+        dialog = ProblemsDialog(self.window, report)
+        self.addCleanup(dialog.deleteLater)
+        with patch("android_backup.gui.ConfirmationDialog.exec", return_value=QDialog.DialogCode.Accepted), patch(
+            "android_backup.gui.Adb.delete_empty_file"
+        ) as delete:
+            self.window.delete_empty_source(dialog, path)
+            self.assertTrue(dialog.deletion_busy)
+            self.wait(lambda: self.window.worker is None and not dialog.deletion_busy)
+        delete.assert_called_once_with(path, report.roots)
+        self.assertIsNone(self.window.inventory)
+        self.assertEqual(report.empty_files, [path])
+        self.assertIn("gelöscht", dialog.action_status.text())
+        self.assertFalse(dialog.delete_source.isEnabled())
+        self.assertTrue(dialog.open_source.isEnabled())
+
+    def test_empty_source_deletion_failure_is_visible_and_allows_retry(self):
+        path = "/storage/emulated/0/Download/empty.jpg"
+        report = Report("phone", ["/storage/emulated/0"], empty_files=[path], status="warnings")
+        self.window.report = report
+        dialog = ProblemsDialog(self.window, report)
+        self.addCleanup(dialog.deleteLater)
+        with patch("android_backup.gui.ConfirmationDialog.exec", return_value=QDialog.DialogCode.Accepted), patch(
+            "android_backup.gui.Adb.delete_empty_file", side_effect=BackupError("Datei ist nicht leer")
+        ):
+            self.window.delete_empty_source(dialog, path)
+            self.wait(lambda: self.window.worker is None and not dialog.deletion_busy)
+        self.assertIn("Datei ist nicht leer", dialog.action_status.text())
+        self.assertTrue(dialog.delete_source.isEnabled())
+        self.assertEqual(dialog.deleted_paths, set())
+
+    def test_empty_source_deletion_rechecks_connected_device_after_confirmation(self):
+        path = "/storage/emulated/0/Download/empty.jpg"
+        report = Report("phone", ["/storage/emulated/0"], empty_files=[path], status="warnings")
+        self.window.report = report
+        dialog = ProblemsDialog(self.window, report)
+        self.addCleanup(dialog.deleteLater)
+        with patch("android_backup.gui.ConfirmationDialog.exec", return_value=QDialog.DialogCode.Accepted), patch(
+            "android_backup.gui.Adb.devices", return_value=[Device("other", "device", "Other")]
+        ), patch("android_backup.gui.Adb.delete_empty_file") as delete:
+            self.window.delete_empty_source(dialog, path)
+            self.wait(lambda: self.window.worker is None and not dialog.deletion_busy)
+        delete.assert_not_called()
+        self.assertIn("Quellgerät", dialog.action_status.text())
+
+    def test_empty_source_delete_button_uses_confirmation_with_safe_default(self):
+        path = "/storage/emulated/0/Download/empty.jpg"
+        report = Report("phone", ["/storage/emulated/0"], empty_files=[path], status="warnings")
+        self.window.report = report
+        confirmations = []
+
+        def reject_confirmation(dialog):
+            confirmations.append(dialog)
+            return QDialog.DialogCode.Rejected
+
+        def click_delete(dialog):
+            dialog.delete_source.click()
+            return QDialog.DialogCode.Accepted
+
+        with patch("android_backup.gui.ProblemsDialog.exec", new=click_delete), patch(
+            "android_backup.gui.ConfirmationDialog.exec", new=reject_confirmation
+        ), patch("android_backup.gui.Adb.delete_empty_file") as delete:
+            self.window.show_problems()
+        self.assertEqual(len(confirmations), 1)
+        confirmation = confirmations[0]
+        self.assertTrue(confirmation.cancel_button.isDefault())
+        self.assertEqual(confirmation.confirm_button.property("variant"), "danger")
+        text = "\n".join(item.text() for item in confirmation.findChildren(QLabel))
+        for expected in (path, "phone", "Kein Papierkorb", "nicht atomar", "0 Byte"):
+            self.assertIn(expected, text)
+        delete.assert_not_called()
+
+    def test_empty_source_deletion_rejects_unknown_path_and_running_operation(self):
+        path = "/storage/emulated/0/Download/empty.jpg"
+        report = Report("phone", ["/storage/emulated/0"], empty_files=[path], status="warnings")
+        self.window.report = report
+        dialog = ProblemsDialog(self.window, report)
+        self.addCleanup(dialog.deleteLater)
+        with patch("android_backup.gui.Adb.delete_empty_file") as delete:
+            self.window.delete_empty_source(dialog, "/storage/emulated/0/another.jpg")
+            self.assertIn("nicht als leere Quelldatei", dialog.action_status.text())
+            self.window.launch(lambda worker: self.window.cancel_event.wait(5), lambda result: None)
+            self.window.delete_empty_source(dialog, path)
+            self.assertIn("laufenden Vorgang", dialog.action_status.text())
+            self.window.cancel()
+            self.wait(lambda: self.window.worker is None)
+        delete.assert_not_called()
+
+    def test_show_source_folder_opens_matching_device_and_surfaces_failures(self):
+        path = "/storage/emulated/0/Download/empty.jpg"
+        report = Report("phone", ["/storage/emulated/0"], empty_files=[path], status="warnings")
+        self.window.report = report
+        dialog = ProblemsDialog(self.window, report)
+        self.addCleanup(dialog.deleteLater)
+        dialog.open_requested.connect(lambda path: self.window.open_source_folder(dialog, path))
+        for error in (None, BackupError("Kein Dateimanager")):
+            with self.subTest(error=error), patch(
+                "android_backup.gui.Adb.open_source_folder", side_effect=error
+            ) as opened:
+                inventory = self.window.inventory
+                dialog.open_source.click()
+                self.assertFalse(dialog.open_source.isEnabled())
+                self.wait(lambda: self.window.worker is None and not dialog.deletion_busy)
+                opened.assert_called_once_with(path, report.roots)
+                self.assertIs(self.window.inventory, inventory)
+                if error:
+                    self.assertIn("Kein Dateimanager", dialog.action_status.text())
+                    self.assertEqual(dialog.action_status.property("tone"), "error")
+                else:
+                    self.assertIn("nicht automatisch markiert", dialog.action_status.text())
+
+    def test_show_source_folder_rejects_wrong_device_and_unlisted_path(self):
+        path = "/storage/emulated/0/Download/empty.jpg"
+        report = Report("other-phone", ["/storage/emulated/0"], empty_files=[path], status="warnings")
+        self.window.report = report
+        dialog = ProblemsDialog(self.window, report)
+        self.addCleanup(dialog.deleteLater)
+        with patch("android_backup.gui.Adb.open_source_folder") as opened:
+            self.window.open_source_folder(dialog, path)
+            self.assertIn("Quellgerät", dialog.action_status.text())
+            self.window.open_source_folder(dialog, "/not-in-report")
+            self.assertIn("nicht im angezeigten Bericht", dialog.action_status.text())
+        opened.assert_not_called()
+
+    def test_source_folder_button_is_wired_and_rechecks_connected_device(self):
+        path = "/storage/emulated/0/Download/empty.jpg"
+        self.window.report = Report(
+            "phone", ["/storage/emulated/0"], empty_files=[path], status="warnings"
+        )
+        statuses = []
+
+        def click_open(dialog):
+            dialog.open_source.click()
+            self.wait(lambda: self.window.worker is None and not dialog.deletion_busy)
+            statuses.append(dialog.action_status.text())
+            return QDialog.DialogCode.Accepted
+
+        with patch("android_backup.gui.ProblemsDialog.exec", new=click_open), patch(
+            "android_backup.gui.Adb.devices", return_value=[]
+        ), patch("android_backup.gui.Adb.open_source_folder") as opened, patch(
+            "android_backup.gui.Adb.delete_empty_file"
+        ) as deleted:
+            self.window.show_problems()
+        self.assertEqual(len(statuses), 1)
+        self.assertIn("nicht verbunden oder nicht autorisiert", statuses[0])
+        opened.assert_not_called()
+        deleted.assert_not_called()
 
 
 class GuiHarnessTests(unittest.TestCase):

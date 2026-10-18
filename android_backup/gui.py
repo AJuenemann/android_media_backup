@@ -179,7 +179,7 @@ class Window(QMainWindow):
         self.scan_issues = CollapsibleSection("Hinweise zur Bestandsaufnahme")
         self.scan_issues.hide()
         preview.content.addWidget(self.scan_issues)
-        exclusions = label("Keine Löschungen · App-Daten, Cache und Installationsdateien ausgeschlossen", "muted")
+        exclusions = label("Sicherung ohne Löschen · App-Daten, Cache und Installationsdateien ausgeschlossen", "muted")
         exclusions.setToolTip(
             "Bilder, Videos, Audio, Dokumente und Downloads aus dem Android-Medienindex "
             "plus Download-Ordner. Die Auswahl kann von Files by Google abweichen. "
@@ -303,8 +303,93 @@ class Window(QMainWindow):
     def show_problems(self) -> None:
         if self.report is not None:
             dialog = ProblemsDialog(self, self.report)
+            dialog.delete_requested.connect(
+                lambda path: self.delete_empty_source(dialog, path)
+            )
+            dialog.open_requested.connect(lambda path: self.open_source_folder(dialog, path))
             dialog.exec()
             dialog.deleteLater()
+
+    def open_source_folder(self, dialog: ProblemsDialog, path: str) -> None:
+        report = self.report
+        device = self.devices.currentData()
+        if self.worker is not None:
+            dialog.folder_failed("Bitte den laufenden Vorgang zuerst beenden.")
+            return
+        if report is None or path not in report.empty_files:
+            dialog.folder_failed("Datei ist nicht im angezeigten Bericht enthalten.")
+            return
+        if device is None or device.serial != report.serial or device.state != "device":
+            dialog.folder_failed("Bitte das Quellgerät dieses Berichts verbinden und USB-Debugging freigeben.")
+            return
+
+        def action(worker: Worker) -> object:
+            devices = Adb.devices(self.cancel_event)
+            if not any(item.serial == report.serial and item.state == "device" for item in devices):
+                raise BackupError("Das Quellgerät ist nicht verbunden oder nicht autorisiert.")
+            Adb(report.serial, self.cancel_event).open_source_folder(path, report.roots)
+            return path
+
+        dialog.set_deletion_busy(True)
+
+        def connect_dialog(worker: Worker) -> None:
+            worker.error.connect(dialog.folder_failed)
+            worker.cancelled.connect(lambda: dialog.folder_failed("Vorgang abgebrochen."))
+            worker.finished.connect(lambda: dialog.set_deletion_busy(False))
+
+        self.launch(
+            action, lambda result: dialog.folder_opened(),
+            "Quellordner auf Smartphone öffnen", connect_dialog,
+        )
+
+    def delete_empty_source(self, dialog: ProblemsDialog, path: str) -> None:
+        report = self.report
+        device = self.devices.currentData()
+        if self.worker is not None:
+            dialog.deletion_failed("Bitte den laufenden Vorgang zuerst beenden.")
+            return
+        if report is None or path not in report.empty_files:
+            dialog.deletion_failed("Datei ist nicht als leere Quelldatei im Bericht enthalten.")
+            return
+        if device is None or device.serial != report.serial or device.state != "device":
+            dialog.deletion_failed("Bitte das Quellgerät dieses Berichts verbinden und für USB-Debugging freigeben.")
+            return
+        confirmation = ConfirmationDialog(
+            dialog, "Leere Quelldatei endgültig löschen",
+            [("Quellgerät", report.serial), ("Datei auf dem Smartphone", path)],
+            "Nur diese Datei wird auf dem Quellgerät gelöscht, nicht im Backup. Kein Papierkorb. "
+            "Die Datei muss weiterhin 0 Byte haben. Dies stellt keine Bilddaten wieder her. "
+            "AyuGram und andere schreibende Apps währenddessen nicht verwenden: "
+            "Prüfung und Löschen sind auf Android nicht atomar.",
+            "Endgültig &löschen", default_accept=False,
+        )
+        with QSignalBlocker(self.device_timer):
+            answer = confirmation.exec()
+        confirmation.deleteLater()
+        if answer != QDialog.DialogCode.Accepted:
+            return
+        serial = report.serial
+
+        def action(worker: Worker) -> object:
+            devices = Adb.devices(self.cancel_event)
+            if not any(item.serial == serial and item.state == "device" for item in devices):
+                raise BackupError("Das Quellgerät ist nicht verbunden oder nicht autorisiert.")
+            Adb(serial, self.cancel_event).delete_empty_file(path, report.roots)
+            return path
+
+        def received(result: object) -> None:
+            dialog.deletion_succeeded(path)
+            self.inventory = None
+            self.append_log(f"Vom Benutzer bestätigte Löschung einer leeren Quelldatei auf {serial}: {path}")
+
+        dialog.set_deletion_busy(True)
+
+        def connect_dialog(worker: Worker) -> None:
+            worker.error.connect(dialog.deletion_failed)
+            worker.cancelled.connect(lambda: dialog.deletion_failed("Vorgang abgebrochen. Dateizustand prüfen."))
+            worker.finished.connect(lambda: dialog.set_deletion_busy(False))
+
+        self.launch(action, received, "Leere Quelldatei löschen", connect_dialog)
 
     @Slot(bool)
     def navigate_log(self, expanded: bool) -> None:
@@ -360,6 +445,7 @@ class Window(QMainWindow):
     def launch(
         self, action: Callable[[Worker], object], result: Callable[[object], None],
         phase: str = "Vorgang läuft",
+        connect_worker: Callable[[Worker], None] | None = None,
     ) -> None:
         if self.worker is not None:
             return
@@ -379,6 +465,8 @@ class Window(QMainWindow):
         self.worker.progress.connect(self.show_progress)
         self.worker.scan_progress.connect(self.show_scan_progress)
         self.worker.finished.connect(self.finished)
+        if connect_worker is not None:
+            connect_worker(self.worker)
         self.started_at = self.last_feedback = time.monotonic()
         self.activity_timer.start()
         self.worker.start()
@@ -753,7 +841,7 @@ class Window(QMainWindow):
             self.show_report(result)
             # A fresh scan is required for the next run, including newly created phone files.
             self.inventory = None
-            self.pending_scan = result.status not in ("cancelled", "failed")
+            self.pending_scan = False
             if not self.isActiveWindow():
                 QApplication.alert(self)
 
@@ -772,6 +860,15 @@ class Window(QMainWindow):
     def show_report(self, report: Report) -> None:
         messages = sum(len(items) for items in report.metadata_warnings.values())
         unprocessed = max(0, report.total - report.saved - report.existing - report.failed)
+        has_problems = bool(
+            report.status in ("cancelled", "failed", "running")
+            or report.failed or report.errors or unprocessed
+            or report.empty_files or messages
+        )
+        self.report_problems.setEnabled(has_problems)
+        self.report_problems.setText(
+            "&Probleme anzeigen" if has_problems else "Keine Probleme festgestellt"
+        )
         tone = (
             "error" if report.status in ("failed", "running") or report.failed or report.errors
             else "warning" if report.status == "cancelled" or report.metadata_warnings or report.empty_files

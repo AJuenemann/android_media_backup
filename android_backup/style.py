@@ -42,6 +42,7 @@ def apply_theme(widget: QWidget, scheme: Qt.ColorScheme) -> None:
         QLabel {{ background: transparent; border: none; }}
         QLabel[role="title"] {{ font-size: 25px; font-weight: 700; }}
         QLabel[role="heading"] {{ font-size: 17px; font-weight: 600; }}
+        QTextBrowser[role="filename"] {{ font-size: 17px; font-weight: 600; }}
         QLabel[role="muted"] {{ color: {muted}; }}
         QLabel[role="stat"] {{ font-size: 25px; font-weight: 700; }}
         QLabel[tone="success"] {{ color: {success}; }}

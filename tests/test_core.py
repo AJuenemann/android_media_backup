@@ -11,6 +11,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import quote
 
 from android_backup.core import (
     Adb, Backup, BackupError, Cancelled, Inventory, Metadata,
@@ -18,6 +19,128 @@ from android_backup.core import (
     excluded_app_file,
     load_report,
 )
+
+
+class EmptySourceDeletionTests(unittest.TestCase):
+    def setUp(self):
+        self.cancel = threading.Event()
+        self.adb = Adb("phone", self.cancel)
+        self.roots = ["/storage/emulated/0"]
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def execute_script(self, script, timeout):
+        result = subprocess.run(
+            ["sh", "-c", script.replace("/storage/emulated/0", str(self.root))],
+            capture_output=True, check=False,
+        )
+        if result.returncode:
+            raise BackupError(result.stderr.decode())
+        return result.stdout
+
+    def test_delete_only_empty_regular_file_with_special_name(self):
+        name = "Bild ' # @ ; $(touch UNEXPECTED)\n.jpg"
+        target = self.root / name
+        target.touch()
+        untouched = self.root / "other.jpg"
+        untouched.touch()
+        with patch.object(self.adb, "checked_shell", side_effect=self.execute_script):
+            self.adb.delete_empty_file("/storage/emulated/0/" + name, self.roots)
+        self.assertFalse(target.exists())
+        self.assertTrue(untouched.exists())
+        self.assertFalse((self.root / "UNEXPECTED").exists())
+
+    def test_nonempty_missing_directory_and_symlink_are_refused(self):
+        (self.root / "filled.jpg").write_bytes(b"redownloaded")
+        (self.root / "empty.jpg").touch()
+        (self.root / "folder").mkdir()
+        (self.root / "link.jpg").symlink_to(self.root / "empty.jpg")
+        (self.root / "alias").symlink_to(self.root, target_is_directory=True)
+        with patch.object(self.adb, "checked_shell", side_effect=self.execute_script):
+            for name in ("filled.jpg", "missing.jpg", "folder", "link.jpg", "alias/empty.jpg"):
+                with self.subTest(name=name), self.assertRaises(BackupError):
+                    self.adb.delete_empty_file("/storage/emulated/0/" + name, self.roots)
+        self.assertEqual((self.root / "filled.jpg").read_bytes(), b"redownloaded")
+        self.assertTrue((self.root / "empty.jpg").exists())
+
+    def test_invalid_paths_never_reach_device(self):
+        with patch.object(self.adb, "checked_shell") as shell:
+            for path, roots in (
+                ("/storage/emulated/0", self.roots),
+                ("/storage/emulated/0/../secret", self.roots),
+                ("/storage/emulated/0//photo.jpg", self.roots),
+                ("/storage/emulated/0/./photo.jpg", self.roots),
+                ("/storage/emulated/0/photo\0.jpg", self.roots),
+                ("/storage/emulated/01/photo.jpg", self.roots),
+                ("/data/private/photo.jpg", ["/data/private"]),
+                ("/storage/emulated/0/photo.jpg", []),
+            ):
+                with self.subTest(path=path), self.assertRaises(BackupError):
+                    self.adb.delete_empty_file(path, roots)
+        shell.assert_not_called()
+
+    def test_device_failure_and_unconfirmed_output_are_not_success(self):
+        for response in (BackupError("USB getrennt"), b"", b"unexpected"):
+            with self.subTest(response=response):
+                with patch.object(
+                    self.adb, "checked_shell",
+                    side_effect=response if isinstance(response, Exception) else None,
+                    return_value=response,
+                ), self.assertRaises(BackupError):
+                    self.adb.delete_empty_file("/storage/emulated/0/empty.jpg", self.roots)
+
+    def test_cancellation_prevents_adb_command_and_sd_root_is_supported(self):
+        self.cancel.set()
+        with patch("android_backup.core.subprocess.Popen") as popen, self.assertRaises(Cancelled):
+            self.adb.delete_empty_file("/storage/emulated/0/empty.jpg", self.roots)
+        popen.assert_not_called()
+        self.cancel.clear()
+        with patch.object(self.adb, "checked_shell", return_value=b"DELETED\n") as shell:
+            self.adb.delete_empty_file("/storage/AB12-CD34/Download/empty.jpg", ["/storage/AB12-CD34"])
+        self.assertIn("/storage/AB12-CD34/Download/empty.jpg", shell.call_args.args[0])
+
+    def test_open_source_folder_encodes_document_uri_and_uses_selected_device(self):
+        for root, volume in (("/storage/emulated/0", "primary"), ("/storage/AB12-CD34", "AB12-CD34")):
+            with self.subTest(root=root):
+                path = root + "/Download/Ayu Gram/#é ' $(name)/photo.jpg"
+                result = subprocess.CompletedProcess([], 0, b"Status: ok\n", b"")
+                with patch.object(self.adb, "shell", return_value=result) as shell:
+                    self.adb.open_source_folder(path, [root])
+                script = shell.call_args.args[0]
+                uri = "content://com.android.externalstorage.documents/document/" + quote(
+                    volume + ":Download/Ayu Gram/#é ' $(name)", safe=""
+                )
+                self.assertIn(shlex.quote(uri), script)
+                self.assertIn("android.intent.action.VIEW", script)
+                self.assertIn("vnd.android.document/directory", script)
+                self.assertNotIn("rm ", script)
+
+    def test_open_source_folder_rejects_invalid_path_and_android_failures(self):
+        with patch.object(self.adb, "shell") as shell, self.assertRaises(BackupError):
+            self.adb.open_source_folder("/data/private/photo.jpg", self.roots)
+        shell.assert_not_called()
+        for code, stdout, stderr in (
+            (0, b"Starting: Intent\n", b"Error: Activity not found\n"),
+            (0, b"Starting: Intent\n", b""),
+            (1, b"", b"Permission denied"),
+            (0, b"Status: ok\n", b"SecurityException: denied"),
+        ):
+            with self.subTest(stderr=stderr), patch.object(
+                self.adb, "shell", return_value=subprocess.CompletedProcess([], code, stdout, stderr)
+            ), self.assertRaises(BackupError):
+                self.adb.open_source_folder("/storage/emulated/0/Download/empty.jpg", self.roots)
+
+    def test_open_source_folder_handles_file_in_storage_root(self):
+        with patch.object(
+            self.adb, "shell", return_value=subprocess.CompletedProcess([], 0, b"Status: ok\n", b"")
+        ) as shell:
+            self.adb.open_source_folder("/storage/emulated/0/photo.jpg", self.roots)
+        self.assertIn(
+            "content://com.android.externalstorage.documents/document/primary%3A",
+            shell.call_args.args[0],
+        )
+        self.assertNotIn("primary%3A.", shell.call_args.args[0])
 
 
 class FakeAdb(Adb):

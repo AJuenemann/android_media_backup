@@ -1,9 +1,10 @@
 from html import escape
+from pathlib import PurePosixPath
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QTextOption
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QCloseEvent, QTextOption
 from PySide6.QtWidgets import (
-    QDialog, QFrame, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton,
+    QApplication, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton,
     QScrollArea, QTextBrowser, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -109,7 +110,8 @@ class InfoDialog(QDialog):
         for title, text in (
             ("Sichern ohne Löschen",
              "Additive USB-Sicherung: Fotos und Videos werden nach Jahren abgelegt, andere Dateien nach Typ. "
-             "Quelldateien und vorhandene Backups werden nicht gelöscht."),
+             "Die Sicherung löscht keine Quelldateien oder vorhandenen Backups. "
+             "Leere Quelldateien können Sie separat in der Problemübersicht ausdrücklich löschen."),
             ("Umfang & Grenzen",
              "Die Auswahl nutzt Android-Kategorien und Download-Ordner und kann von Files by Google abweichen. "
              "Technische App-Daten, Cache und Installationsdateien sind ausgeschlossen. "
@@ -134,11 +136,16 @@ class InfoDialog(QDialog):
 
 
 class ProblemsDialog(QDialog):
+    delete_requested = Signal(str)
+    open_requested = Signal(str)
+
     def __init__(self, parent: QWidget, report: Report):
         super().__init__(parent)
+        self.deletion_busy = False
+        self.deleted_paths: set[str] = set()
         self.setWindowTitle("Probleme der Sicherung")
         self.setWindowIcon(parent.windowIcon())
-        self.resize(900, 560)
+        self.resize(900, 720 if report.empty_files else 560)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(14)
@@ -201,10 +208,105 @@ class ProblemsDialog(QDialog):
                 "Im Schnelllauf übersprungene Dateien wurden nicht erneut auf Inhaltsgleichheit geprüft."
             ) + "</p>")
         self.problems.setHtml("".join(sections))
-        close = QPushButton("&Schließen")
-        close.clicked.connect(self.accept)
-        close.setDefault(True)
-        layout.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
+        self.empty_actions = Card("Leere Quelldatei bearbeiten")
+        self.empty_files = QComboBox()
+        self.empty_files.setAccessibleName("Leere Quelldatei auswählen")
+        self.empty_files.setMinimumContentsLength(20)
+        self.empty_files.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.empty_files.addItems(list(dict.fromkeys(report.empty_files)))
+        self.empty_actions.content.addWidget(self.empty_files)
+        self.empty_actions.content.addWidget(label("Dateiname auf dem Smartphone", "heading"))
+        self.source_name = QTextBrowser()
+        self.source_name.setProperty("role", "filename")
+        self.source_name.setAccessibleName("Vollständiger Dateiname auf dem Smartphone")
+        self.source_name.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
+        self.source_name.setMinimumHeight(80)
+        self.source_name.setMaximumHeight(110)
+        self.empty_actions.content.addWidget(self.source_name)
+        self.empty_actions.content.addWidget(label(
+            "Im geöffneten Ordner diesen Namen suchen und in den Dateidetails 0 Byte prüfen. "
+            "Die Datei wird nicht automatisch markiert.", "muted"
+        ))
+        self.delete_source = QPushButton("Auf Smartphone &löschen …")
+        self.delete_source.setProperty("variant", "danger")
+        self.delete_source.clicked.connect(self.request_delete)
+        self.empty_files.currentIndexChanged.connect(self.update_empty_actions)
+        self.open_source = QPushButton("&Ordner auf Smartphone öffnen")
+        self.open_source.setToolTip(
+            "Öffnet den enthaltenden Ordner im Android-Dateimanager. "
+            "Eine automatische Dateimarkierung wird nicht unterstützt."
+        )
+        self.open_source.clicked.connect(self.request_open)
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.open_source)
+        buttons.addWidget(self.delete_source)
+        self.empty_actions.content.addLayout(buttons)
+        self.action_status = label(
+            "Löschen ist endgültig und stellt keine Bilddaten wieder her. "
+            "Die Datei wird vor dem Löschen erneut auf 0 Byte geprüft. "
+            "AyuGram und andere schreibende Apps währenddessen nicht verwenden.", "muted"
+        )
+        self.empty_actions.content.addWidget(self.action_status)
+        self.empty_actions.setVisible(bool(report.empty_files))
+        layout.addWidget(self.empty_actions)
+        self.close_button = QPushButton("&Schließen")
+        self.close_button.clicked.connect(self.accept)
+        self.close_button.setDefault(True)
+        layout.addWidget(self.close_button, 0, Qt.AlignmentFlag.AlignRight)
+        self.update_empty_actions()
+
+    def request_delete(self) -> None:
+        self.delete_requested.emit(self.empty_files.currentText())
+
+    def request_open(self) -> None:
+        self.open_requested.emit(self.empty_files.currentText())
+
+    def update_empty_actions(self) -> None:
+        self.delete_source.setEnabled(
+            not self.deletion_busy and bool(self.empty_files.currentText())
+            and self.empty_files.currentText() not in self.deleted_paths
+        )
+        self.empty_files.setToolTip(self.empty_files.currentText())
+        self.source_name.setPlainText(PurePosixPath(self.empty_files.currentText()).name)
+
+    def set_deletion_busy(self, busy: bool) -> None:
+        self.deletion_busy = busy
+        for widget in (self.empty_files, self.close_button, self.open_source):
+            widget.setEnabled(not busy)
+        self.update_empty_actions()
+
+    def deletion_succeeded(self, path: str) -> None:
+        self.deleted_paths.add(path)
+        self.action_status.setText(
+            f"Auf dem Smartphone gelöscht: {path}\n"
+            "Der historische Bericht und vorhandene Backups bleiben unverändert. Bestand neu einlesen."
+        )
+        set_role(self.action_status, "tone", "success")
+
+    def deletion_failed(self, message: str) -> None:
+        self.action_status.setText("Löschen nicht bestätigt: " + message)
+        set_role(self.action_status, "tone", "error")
+
+    def folder_opened(self) -> None:
+        self.action_status.setText(
+            "Android hat das Öffnen des Quellordners bestätigt. "
+            "Bitte auf dem Smartphone prüfen. Die Datei wird nicht automatisch markiert."
+        )
+        set_role(self.action_status, "tone", "success")
+
+    def folder_failed(self, message: str) -> None:
+        self.action_status.setText("Ordner nicht geöffnet: " + message)
+        set_role(self.action_status, "tone", "error")
+
+    def reject(self) -> None:
+        if not self.deletion_busy:
+            super().reject()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self.deletion_busy:
+            event.ignore()
+        else:
+            super().closeEvent(event)
 
 
 def error_impact(message: str) -> str:

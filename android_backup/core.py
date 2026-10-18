@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Callable
+from urllib.parse import quote
 
 
 class BackupError(Exception):
@@ -326,6 +327,57 @@ done
         except ValueError as exc:
             raise BackupError(f"Ungültige Dateiinformationen für {path!r}") from exc
         return SourceFile(path, size, mtime)
+
+    def source_root(self, path: str, roots: list[str]) -> PurePosixPath:
+        source = PurePosixPath(path)
+        valid_roots = [
+            PurePosixPath(root) for root in roots
+            if re.fullmatch(r"/storage/(?:emulated/[0-9]+|[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4})", root)
+        ]
+        if (
+            "\0" in path or str(source) != path or ".." in source.parts
+            or not any(source.is_relative_to(root) and source != root for root in valid_roots)
+        ):
+            raise BackupError("Ungültiger Dateipfad außerhalb des erfassten gemeinsamen Speichers.")
+        return next(root for root in valid_roots if source.is_relative_to(root) and source != root)
+
+    def open_source_folder(self, path: str, roots: list[str]) -> None:
+        root = self.source_root(path, roots)
+        volume = "primary" if str(root).startswith("/storage/emulated/") else root.name
+        relative = PurePosixPath(path).parent.relative_to(root).as_posix()
+        document = volume + ":" + ("" if relative == "." else relative)
+        uri = "content://com.android.externalstorage.documents/document/" + quote(document, safe="")
+        script = (
+            f"test -d {shlex.quote(str(PurePosixPath(path).parent))} || "
+            '{ printf "%s\\n" "Quellordner nicht vorhanden oder nicht zugänglich." >&2; exit 1; }\n'
+            f"am start -W -a android.intent.action.VIEW -d {shlex.quote(uri)} "
+            "-t vnd.android.document/directory -f 0x00000001"
+        )
+        result = self.shell(script, timeout=20)
+        output = (result.stdout + b"\n" + result.stderr).decode("utf-8", errors="replace")
+        if result.returncode or re.search(r"(?im)^\s*(?:error|exception|securityexception)[: ]", output):
+            raise BackupError(
+                "Android konnte den Quellordner nicht öffnen. Smartphone entsperren; "
+                "eventuell unterstützt der Dateimanager diese Aktion nicht.\n" + output.strip()
+            )
+        if not re.search(r"(?m)^Status: ok\s*$", output):
+            raise BackupError("Android hat das Öffnen des Quellordners nicht bestätigt.\n" + output.strip())
+
+    def delete_empty_file(self, path: str, roots: list[str]) -> None:
+        self.source_root(path, roots)
+        quoted = shlex.quote(path)
+        # shortcut: Android has no atomic unlink-if-empty; keep the source app idle during deletion.
+        output = self.checked_shell(
+            f"p={quoted}\n"
+            'test "$(readlink -f "$p")" = "$p" && test ! -L "$p" && test -f "$p" '
+            '&& test "$(stat -c %s "$p")" = 0 || { '
+            'printf "%s\\n" "Löschen verweigert: Datei fehlt, ist nicht leer oder ist ein symbolischer Link." >&2; exit 1; }\n'
+            'rm -- "$p" || exit 1\n'
+            'printf "DELETED\\n"',
+            timeout=15,
+        )
+        if output != b"DELETED\n":
+            raise BackupError("Löschung wurde vom Smartphone nicht eindeutig bestätigt. Bitte Dateizustand prüfen.")
 
     def digest(self, path: str) -> str:
         output = self.checked_shell(f"sha256sum < {shlex.quote(path)}", timeout=3600)
