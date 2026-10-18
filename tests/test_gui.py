@@ -1,17 +1,23 @@
 import os
+import json
+import sys
 import tempfile
 import time
+import traceback
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings, QThread, Qt
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtCore import QCoreApplication, QEvent, QSettings, QThread, QTimer, Qt
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication, QDialog, QLabel, QPushButton, QScrollArea
 
 from android_backup.core import BackupError, Cancelled, Device, Inventory, Report
 from android_backup.gui import Window
+from android_backup.widgets import Card, ConfirmationDialog, InfoDialog, ProblemsDialog, error_impact, metadata_impact
 from tests.test_core import FakeAdb, FakeMetadata
 
 
@@ -22,7 +28,16 @@ class GuiTests(unittest.TestCase):
         cls.app.setStyle("Fusion")
 
     def setUp(self):
+        self.qt_errors = []
+        self.addCleanup(setattr, sys, "excepthook", sys.excepthook)
+        self.addCleanup(self.assert_no_qt_errors)
+
+        def capture_qt_error(exc_type, value, tb):
+            self.qt_errors.append("".join(traceback.format_exception(exc_type, value, tb)))
+
+        sys.excepthook = capture_qt_error
         self.settings_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.settings_directory.cleanup)
         self.settings_path = str(Path(self.settings_directory.name) / "settings.ini")
         self.patches = [
             patch("android_backup.gui.QSettings", side_effect=lambda *args: QSettings(
@@ -37,20 +52,27 @@ class GuiTests(unittest.TestCase):
         ]
         for item in self.patches[:-1]:
             item.start()
+            self.addCleanup(item.stop)
         self.scan_mock = self.patches[-1].start()
+        self.addCleanup(self.patches[-1].stop)
         self.window = Window()
+        self.addCleanup(self.cleanup_window)
         self.window.show()
         self.wait(lambda: self.window.devices.count() == 1 and self.window.worker is None)
+        self.assertTrue(self.window.device_timer.isActive())
+        self.window.device_timer.stop()
 
-    def tearDown(self):
+    def assert_no_qt_errors(self):
+        self.assertFalse(self.qt_errors, "Unhandled Qt callback exceptions:\n" + "\n".join(self.qt_errors))
+
+    def cleanup_window(self):
         if self.window.worker is not None:
             self.window.cancel()
             self.wait(lambda: self.window.worker is None)
         self.window.close()
+        self.window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.app.processEvents()
-        for item in reversed(self.patches):
-            item.stop()
-        self.settings_directory.cleanup()
 
     def wait(self, predicate, seconds=10):
         deadline = time.monotonic() + seconds
@@ -73,7 +95,7 @@ class GuiTests(unittest.TestCase):
             "android_backup.gui.Adb", return_value=fake
         ), patch.object(fake, "scan", return_value=inventory), patch(
             "android_backup.gui.Metadata", return_value=FakeMetadata(self.window.cancel_event)
-        ), patch("android_backup.gui.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+        ), patch("android_backup.gui.ConfirmationDialog.exec", return_value=QDialog.DialogCode.Accepted):
             self.window.target.setText(folder)
             self.window.scan_device()
             self.wait(lambda: self.window.worker is None)
@@ -93,13 +115,14 @@ class GuiTests(unittest.TestCase):
     def test_worker_runs_off_gui_thread_and_cancels(self):
         gui_thread = self.app.thread()
         worker_threads = []
+        results = []
 
         def action(worker):
             worker_threads.append(QThread.currentThread())
             self.window.cancel_event.wait(5)
             raise Cancelled("cancel")
 
-        self.window.launch(action, lambda result: self.fail("Cancellation returned success"))
+        self.window.launch(action, results.append)
         self.wait(lambda: bool(worker_threads))
         self.assertNotEqual(worker_threads[0], gui_thread)
         self.assertFalse(self.window.refresh.isEnabled())
@@ -107,6 +130,7 @@ class GuiTests(unittest.TestCase):
         self.wait(lambda: self.window.worker is None)
         self.assertTrue(self.window.refresh.isEnabled())
         self.assertEqual(self.window.current.text(), "Abgebrochen")
+        self.assertEqual(results, [])
 
     def test_result_handler_runs_on_gui_thread(self):
         threads = []
@@ -284,6 +308,8 @@ class GuiTests(unittest.TestCase):
         self.scan_mock.reset_mock()
         self.scan_mock.side_effect = scanning
         self.window.scan.click()
+        self.assertFalse(self.window.scan.isEnabled())
+        self.assertEqual(self.window.scan.text(), "Bestand wird eingelesen …")
         self.assertTrue(self.window.progress_card.isVisible())
         self.assertEqual(self.window.start.property("variant"), "danger")
         self.window.start.click()
@@ -291,6 +317,8 @@ class GuiTests(unittest.TestCase):
         self.wait(lambda: self.window.worker is None)
         self.app.processEvents()
         self.assertEqual(self.scan_mock.call_count, 1)
+        self.assertTrue(self.window.scan.isEnabled())
+        self.assertEqual(self.window.scan.text(), "Bestand &neu einlesen")
         self.assertIsNone(self.window.inventory)
         self.assertFalse(self.window.pending_scan)
         self.assertEqual(self.window.start.property("variant"), "primary")
@@ -319,7 +347,7 @@ class GuiTests(unittest.TestCase):
                       self.window.report_warnings.details.toPlainText())
         self.assertIn("2 Meldungen bei 1 Dateien", self.window.report_summary.text())
         self.assertIn("keine Inhaltsgleichheit", self.window.report_summary.text())
-        self.assertFalse(self.window.report_folder.isEnabled())
+        self.assertTrue(self.window.report_problems.isEnabled())
 
     def test_report_outcomes_do_not_claim_success_on_warnings_or_cancellation(self):
         cases = [
@@ -337,7 +365,7 @@ class GuiTests(unittest.TestCase):
                 self.assertEqual(self.window.result_status.property("tone"), tone)
 
     def test_banner_logs_and_displays_error_without_modal_dialog(self):
-        with patch("android_backup.gui.QMessageBox.warning") as warning:
+        with patch("PySide6.QtWidgets.QMessageBox.warning") as warning:
             self.window.show_error("<untrusted> Testfehler")
         warning.assert_not_called()
         self.assertTrue(self.window.banner.isVisible())
@@ -373,13 +401,105 @@ class GuiTests(unittest.TestCase):
         self.window.copy_log()
         self.assertEqual(self.app.clipboard().text(), self.window.log.toPlainText())
 
-    def test_report_folder_open_failure_is_visible(self):
+    def test_problem_button_opens_report_without_requiring_report_file(self):
         report = Report("phone", [], report_path="/tmp/backup/.backup/report.json", status="complete")
         self.window.show_report(report)
-        with patch("android_backup.gui.QDesktopServices.openUrl", return_value=False) as opened:
-            self.window.report_folder.click()
-        self.assertEqual(opened.call_args.args[0].toLocalFile(), "/tmp/backup/.backup")
-        self.assertIn("Berichtsordner konnte nicht geöffnet", self.window.banner.message.text())
+        with patch("android_backup.gui.ProblemsDialog", autospec=True) as dialog:
+            self.window.report_problems.click()
+        dialog.assert_called_once_with(self.window, report)
+        dialog.return_value.exec.assert_called_once()
+
+    def test_problem_overview_lists_each_message_path_and_impact(self):
+        report = Report(
+            "phone", [], total=6, saved=2, failed=1, status="cancelled",
+            errors=["/photo.jpg: Zu wenig freier Speicherplatz für die nächste Datei."],
+            empty_files=["/empty.jpg"],
+            metadata_warnings={
+                "/photo <1>.jpg": ["Invalid EXIF text encoding for UserComment",
+                                   "Bad length ICC_Profile", "Ungültiges Aufnahmedatum DateTimeOriginal='0'",
+                                   "Kein verlässlich bestimmbares Jahr", "Unbekannte Warnung"],
+            },
+        )
+        dialog = ProblemsDialog(self.window, report)
+        text = dialog.problems.toPlainText()
+        for expected in (
+            "Sicherung abgebrochen", "nicht bestätigt", "Platz schaffen",
+            "Nicht bearbeitete Dateien (3)", "/empty.jpg", "/photo <1>.jpg",
+            "Kommentare", "Farben", "anderes gültiges Aufnahmedatum", "Unbekannt",
+            "nicht sicher ableitbar",
+        ):
+            self.assertIn(expected, text)
+        for warning in report.metadata_warnings["/photo <1>.jpg"]:
+            self.assertIn(warning, text)
+        self.assertEqual(text.count("Meldung:"), 7)
+        self.assertEqual(text.count("Auswirkung:"), 7)
+        dialog.deleteLater()
+
+    def test_problem_overview_handles_clean_and_failed_reports_without_details(self):
+        for status, failed in (("complete", 0), ("failed", 1)):
+            with self.subTest(status=status):
+                dialog = ProblemsDialog(self.window, Report("phone", [], status=status, total=failed, failed=failed))
+                if not failed:
+                    self.assertIn("Keine Probleme gemeldet", dialog.problems.toPlainText())
+                else:
+                    self.assertIn("Sicherung gestoppt", dialog.problems.toPlainText())
+                    self.assertIn("Fehlgeschlagene Dateien: 1", dialog.problems.toPlainText())
+                dialog.deleteLater()
+
+    def test_log_toggle_scrolls_and_focuses_then_restores_previous_area(self):
+        self.window.show_report(Report("phone", [], status="complete"))
+        self.window.resize(760, 600)
+        self.app.processEvents()
+        self.window.dashboard_scroll.verticalScrollBar().setValue(0)
+        original_scroll = self.window.dashboard_scroll.verticalScrollBar().value()
+        self.window.log_section.toggle.click()
+        self.wait(lambda: self.app.focusWidget() == self.window.log)
+        viewport = self.window.dashboard_scroll.viewport()
+        top = self.window.log.mapTo(viewport, self.window.log.rect().topLeft()).y()
+        bottom = self.window.log.mapTo(viewport, self.window.log.rect().bottomRight()).y()
+        self.assertGreaterEqual(top, 0)
+        self.assertLessEqual(bottom, viewport.height())
+        self.assertGreater(self.window.dashboard_scroll.verticalScrollBar().value(), original_scroll)
+        self.window.log_section.toggle.click()
+        self.wait(lambda: self.app.focusWidget() == self.window.report_problems)
+        self.assertFalse(self.window.log.isVisible())
+        self.assertEqual(self.window.dashboard_scroll.verticalScrollBar().value(), original_scroll)
+
+    def test_log_collapse_without_report_returns_to_scan(self):
+        self.window.log_section.toggle.click()
+        self.wait(lambda: self.app.focusWidget() == self.window.log)
+        self.window.log_section.toggle.click()
+        self.wait(lambda: self.app.focusWidget() == self.window.scan)
+
+    def test_known_problem_effects_and_unknown_fallback_are_explicit(self):
+        for message, expected in (
+            ("Zu wenig freier Speicherplatz für die nächste Datei.", "Platz schaffen"),
+            ("[Errno 28] No space left on device", "Platz schaffen"),
+            ("Vorhandenes Backup fehlt oder ist beschädigt: /photo.jpg", "nicht überschrieben"),
+            ("Bestandsaufnahme von /storage unvollständig", "übersehen"),
+            ("Unvollständiger Android-Indexeintrag /photo.jpg", "übersehen"),
+            ("Permission denied", "Zugriff verweigert"),
+            ("Quelldatei wurde während der Sicherung verändert.", "Keine bestätigte Kopie"),
+            ("Unbekannter Fehler", "keine erfolgreiche Sicherung bestätigt"),
+        ):
+            with self.subTest(message=message):
+                self.assertIn(expected, error_impact(message))
+        self.assertIn("nicht sicher ableitbar", metadata_impact("Unbekannte Warnung"))
+
+    def test_problem_overview_keeps_long_paths_and_markup_as_readable_text(self):
+        path = "/storage/" + "langer-pfad/" * 50 + "<b>Original</b>.jpg"
+        message = "<script>keine Formatierung</script>"
+        dialog = ProblemsDialog(self.window, Report(
+            "phone", [], status="warnings", metadata_warnings={path: [message]},
+        ))
+        dialog.resize(760, 500)
+        dialog.show()
+        self.app.processEvents()
+        self.assertIn(path, dialog.problems.toPlainText())
+        self.assertIn(message, dialog.problems.toPlainText())
+        self.assertEqual(dialog.problems.horizontalScrollBar().maximum(), 0)
+        dialog.close()
+        dialog.deleteLater()
 
     def test_backup_rescans_only_after_a_completed_run(self):
         self.window.target.setText(self.settings_directory.name)
@@ -389,8 +509,8 @@ class GuiTests(unittest.TestCase):
                 self.scan_mock.reset_mock()
                 report = Report("phone", [], status=status)
                 with patch("android_backup.gui.Backup") as backup, patch(
-                    "android_backup.gui.QMessageBox.question",
-                    return_value=QMessageBox.StandardButton.Yes,
+                    "android_backup.gui.ConfirmationDialog.exec",
+                    return_value=QDialog.DialogCode.Accepted,
                 ):
                     backup.return_value.run.return_value = report
                     self.window.start_backup()
@@ -422,17 +542,366 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(self.window.progress.maximum(), 4)
 
     def test_closing_during_work_cancels_and_waits_before_closing(self):
+        results = []
+
         def action(worker):
             self.window.cancel_event.wait(5)
             raise Cancelled("cancel")
 
-        self.window.launch(action, lambda result: self.fail("Unexpected success"))
-        with patch("android_backup.gui.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
+        self.window.launch(action, results.append)
+        with patch("android_backup.gui.ConfirmationDialog.exec", return_value=QDialog.DialogCode.Accepted):
             self.window.close()
         self.assertTrue(self.window.close_requested)
         self.wait(lambda: self.window.worker is None)
         self.assertFalse(self.window.isVisible())
         self.assertFalse(self.window.pending_scan)
+        self.assertEqual(results, [])
+
+    def test_hotplug_timer_detects_connection_and_authorization(self):
+        with patch("android_backup.gui.Adb.devices", return_value=[]):
+            self.window.refresh_devices()
+            self.wait(lambda: self.window.worker is None)
+        self.scan_mock.reset_mock()
+        self.window.device_timer.setInterval(10)
+        with patch("android_backup.gui.Adb.devices", return_value=[
+            Device("new", "unauthorized", "New phone")
+        ]):
+            self.wait(lambda: self.window.devices.count() == 1 and self.window.device_monitor is None)
+            self.assertIn("Freigabe", self.window.device_status.text())
+            self.assertIsNone(self.window.inventory)
+        with patch("android_backup.gui.Adb.devices", return_value=[
+            Device("new", "device", "New phone")
+        ]):
+            self.wait(lambda: self.window.inventory is not None and self.window.worker is None
+                      and self.window.device_monitor is None)
+        self.window.device_timer.stop()
+        self.assertEqual(self.window.inventory.serial, "new")
+        self.assertEqual(self.scan_mock.call_count, 1)
+        self.assertFalse(self.window.result_card.isVisible())
+
+    def test_poll_preserves_unchanged_inventory_and_selected_device(self):
+        inventory = self.window.inventory
+        devices = [self.window.devices.currentData(), Device("other", "device", "Other")]
+        self.scan_mock.reset_mock()
+        with patch("android_backup.gui.Adb.devices", return_value=devices):
+            for _ in range(2):
+                self.window.poll_devices()
+                self.wait(lambda: self.window.device_monitor is None)
+        self.assertIs(self.window.inventory, inventory)
+        self.assertEqual(self.window.devices.currentData().serial, "phone")
+        self.scan_mock.assert_not_called()
+
+    def test_poll_disconnect_invalidates_inventory(self):
+        self.window.target.setText(self.settings_directory.name)
+        self.assertTrue(self.window.start.isEnabled())
+        with patch("android_backup.gui.Adb.devices", return_value=[]):
+            self.window.poll_devices()
+            self.wait(lambda: self.window.device_monitor is None)
+        self.assertIsNone(self.window.inventory)
+        self.assertFalse(self.window.start.isEnabled())
+        self.assertIn("Kein Gerät", self.window.device_status.text())
+
+    def test_poll_does_not_interfere_with_running_operation(self):
+        def action(worker):
+            self.window.cancel_event.wait(5)
+            raise Cancelled("cancel")
+
+        self.window.launch(action, lambda result: None)
+        with patch("android_backup.gui.Adb.devices") as devices:
+            self.window.poll_devices()
+        devices.assert_not_called()
+        self.assertIsNone(self.window.device_monitor)
+        self.window.cancel()
+        self.wait(lambda: self.window.worker is None)
+
+    def test_stale_monitor_result_does_not_replace_newer_manual_search(self):
+        self.window.monitor_generation = self.window.operation_generation - 1
+        inventory = self.window.inventory
+        self.window.receive_device_update([])
+        self.assertIs(self.window.inventory, inventory)
+        self.assertEqual(self.window.devices.count(), 1)
+
+    def test_monitor_failure_is_visible_and_stops_polling_until_retry(self):
+        self.window.device_timer.start()
+        with patch("android_backup.gui.Adb.devices", side_effect=BackupError("ADB offline")):
+            self.window.poll_devices()
+            self.wait(lambda: self.window.device_monitor is None)
+        self.assertFalse(self.window.device_timer.isActive())
+        self.assertIsNone(self.window.inventory)
+        self.assertIn("Automatische Geräteerkennung fehlgeschlagen", self.window.banner.message.text())
+        self.window.refresh_devices()
+        self.wait(lambda: self.window.worker is None)
+        self.assertTrue(self.window.device_timer.isActive())
+
+    def test_close_cancels_and_joins_background_device_monitor(self):
+        def detect(cancel):
+            cancel.wait(5)
+            raise Cancelled("cancel")
+
+        with patch("android_backup.gui.Adb.devices", side_effect=detect):
+            self.window.poll_devices()
+            self.assertIsNotNone(self.window.device_monitor)
+            self.window.close()
+        self.assertIsNone(self.window.device_monitor)
+        self.assertTrue(self.window.monitor_cancel.is_set())
+        self.assertFalse(self.window.device_timer.isActive())
+
+    def test_backup_confirmation_keeps_device_selection_stable(self):
+        self.window.target.setText(self.settings_directory.name)
+        self.window.monitor_generation = self.window.operation_generation
+        inventory = self.window.inventory
+
+        def confirm(*args):
+            self.assertTrue(self.window.device_timer.signalsBlocked())
+            self.window.receive_device_update([])
+            self.assertIs(self.window.inventory, inventory)
+            return QDialog.DialogCode.Rejected
+
+        with patch("android_backup.gui.ConfirmationDialog.exec", side_effect=confirm):
+            self.window.start_backup()
+        self.assertFalse(self.window.device_timer.signalsBlocked())
+        self.assertIsNone(self.window.worker)
+
+    def test_scan_button_stays_disabled_during_progress_and_recovers_after_completion(self):
+        import threading
+
+        release = threading.Event()
+
+        def scan(adb, progress):
+            progress(12, 1024, "/storage/photo.jpg")
+            release.wait(5)
+            return Inventory(adb.serial, [], [])
+
+        self.scan_mock.reset_mock()
+        self.scan_mock.side_effect = scan
+        self.window.scan.click()
+        try:
+            self.wait(lambda: "12 Dateien" in self.window.current.text())
+            self.assertFalse(self.window.scan.isEnabled())
+            self.window.scan.click()
+            self.assertEqual(self.scan_mock.call_count, 1)
+        finally:
+            release.set()
+            self.wait(lambda: self.window.worker is None)
+        self.assertTrue(self.window.scan.isEnabled())
+        self.assertEqual(self.window.scan.text(), "Bestand &neu einlesen")
+
+    def test_start_dialog_uses_german_actions_and_enter_confirms_escape_cancels(self):
+        for key, expected in (
+            (Qt.Key.Key_Return, QDialog.DialogCode.Accepted),
+            (Qt.Key.Key_Escape, QDialog.DialogCode.Rejected),
+        ):
+            with self.subTest(key=key):
+                dialog = ConfirmationDialog(
+                    self.window, "Sicherung starten", [("Zielordner", "/tmp/Backup <Fotos>")],
+                    "Vorhandene Inhalte bleiben erhalten.", "Sicherung &starten",
+                )
+                dialog.show()
+                self.app.processEvents()
+                self.assertTrue(dialog.confirm_button.isDefault())
+                self.assertEqual(dialog.confirm_button.text(), "Sicherung &starten")
+                self.assertEqual(dialog.cancel_button.text(), "&Abbrechen")
+                self.assertEqual(dialog.confirm_button.property("variant"), "primary")
+                self.assertTrue(any(
+                    item.text() == "/tmp/Backup <Fotos>" and item.textFormat() == Qt.TextFormat.PlainText
+                    for item in dialog.findChildren(QLabel)
+                ))
+                QTest.keyClick(dialog, key)
+                self.assertEqual(dialog.result(), expected)
+                self.assertFalse(dialog.isVisible())
+                dialog.deleteLater()
+
+    def test_rejecting_real_confirmation_does_not_start_backup(self):
+        self.window.target.setText(self.settings_directory.name)
+        for action in ("escape", "cancel", "close"):
+            with self.subTest(action=action):
+                dialogs = []
+
+                def reject_dialog():
+                    dialog = self.window.findChild(ConfirmationDialog)
+                    dialogs.append(dialog)
+                    if action == "escape":
+                        QTest.keyClick(dialog, Qt.Key.Key_Escape)
+                    elif action == "cancel":
+                        dialog.cancel_button.click()
+                    else:
+                        dialog.close()
+
+                QTimer.singleShot(0, self.window, reject_dialog)
+                with patch("android_backup.gui.Backup") as backup:
+                    self.window.start_backup()
+                self.assertEqual(len(dialogs), 1)
+                self.assertFalse(dialogs[0].isVisible())
+                backup.assert_not_called()
+                self.assertIsNone(self.window.worker)
+                QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+    def test_log_collapse_during_scan_focuses_enabled_action(self):
+        def scan(adb, progress):
+            self.window.cancel_event.wait(5)
+            raise Cancelled("cancel")
+
+        self.scan_mock.side_effect = scan
+        self.window.scan.click()
+        self.assertFalse(self.window.scan.isEnabled())
+        self.window.log_section.toggle.click()
+        self.wait(lambda: self.app.focusWidget() == self.window.log)
+        self.window.log_section.toggle.click()
+        self.wait(lambda: self.app.focusWidget() == self.window.start)
+        self.assertTrue(self.window.start.isEnabled())
+        self.assertTrue(self.window.start.isVisible())
+        self.window.cancel()
+        self.wait(lambda: self.window.worker is None)
+
+    def test_log_collapse_without_device_focuses_toggle(self):
+        with patch("android_backup.gui.Adb.devices", return_value=[]):
+            self.window.refresh_devices()
+            self.wait(lambda: self.window.worker is None)
+        self.window.device_timer.stop()
+        self.window.log_section.toggle.click()
+        self.wait(lambda: self.app.focusWidget() == self.window.log)
+        self.window.log_section.toggle.click()
+        self.wait(lambda: self.app.focusWidget() == self.window.log_section.toggle)
+
+    def test_close_confirmation_defaults_to_cancel(self):
+        dialog = ConfirmationDialog(
+            self.window, "Vorgang läuft", [], "Sicherung nicht vollständig.",
+            "Vorgang &abbrechen und schließen", default_accept=False,
+        )
+        self.assertTrue(dialog.cancel_button.isDefault())
+        self.assertFalse(dialog.confirm_button.isDefault())
+        dialog.deleteLater()
+
+    def test_info_button_opens_themed_dialog(self):
+        with patch("android_backup.gui.InfoDialog", autospec=True) as dialog:
+            button = next(button for button in self.window.findChildren(QPushButton)
+                          if button.text() == "&Info")
+            button.click()
+        dialog.assert_called_once_with(self.window)
+        dialog.return_value.exec.assert_called_once()
+
+    def test_info_dialog_preserves_explanations_and_closes_by_keyboard(self):
+        for scheme, key in (
+            (Qt.ColorScheme.Light, Qt.Key.Key_Return),
+            (Qt.ColorScheme.Dark, Qt.Key.Key_Escape),
+        ):
+            with self.subTest(scheme=scheme):
+                self.window.update_theme(scheme)
+                dialog = InfoDialog(self.window)
+                dialog.show()
+                self.app.processEvents()
+                text = "\n".join(item.text() for item in dialog.findChildren(QLabel))
+                for expected in (
+                    "Über die Sicherung", "nicht gelöscht", "Files by Google",
+                    "Gesperrte Bereiche", "Cache", "keine Inhaltsgleichheit",
+                    "vollständige Integritätsprüfung",
+                ):
+                    self.assertIn(expected, text)
+                self.assertEqual(len(dialog.findChildren(Card)), 3)
+                self.assertTrue(dialog.close_button.isDefault())
+                self.assertEqual(dialog.close_button.text(), "&Schließen")
+                self.assertEqual(dialog.close_button.property("variant"), "primary")
+                self.assertEqual(dialog.findChild(QScrollArea).horizontalScrollBar().maximum(), 0)
+                QTest.keyClick(dialog, key)
+                self.assertFalse(dialog.isVisible())
+                dialog.deleteLater()
+
+    def test_open_report_loads_selected_file_and_reveals_report_heading(self):
+        for size, lines in (((1000, 860), 1), ((760, 600), 30)):
+            with self.subTest(size=size):
+                self.window.resize(*size)
+                self.app.processEvents()
+                report = Report(
+                    "previous-phone", [], total=4, saved=2, existing=1, failed=1,
+                    status="issues", errors=["/DCIM/photo.jpg: Zugriff verweigert"],
+                    selection="\n".join(["Erfasster Bereich"] * lines),
+                )
+                path = Path(self.settings_directory.name) / f"report-{lines}.json"
+                path.write_text(json.dumps(asdict(report)), encoding="utf-8")
+                self.window.dashboard_scroll.verticalScrollBar().setValue(0)
+                with patch("android_backup.gui.QFileDialog.getOpenFileName", return_value=(str(path), "")):
+                    self.window.open_report.click()
+                self.wait(lambda: self.app.focusWidget() == self.window.result_card)
+                self.assertEqual(self.window.report.serial, "previous-phone")
+                self.assertIn(str(path), self.window.result_context.text())
+                self.assertEqual(self.window.result_stats["saved"].value.text(), "2")
+                self.assertEqual(self.window.result_stats["failed"].value.text(), "1")
+                self.assertIn(report.errors[0], self.window.report_errors.details.toPlainText())
+                viewport = self.window.dashboard_scroll.viewport()
+                for widget in (self.window.result_status, self.window.result_context):
+                    top = widget.mapTo(viewport, widget.rect().topLeft()).y()
+                    bottom = widget.mapTo(viewport, widget.rect().bottomRight()).y()
+                    self.assertGreaterEqual(top, 0)
+                    self.assertLess(bottom, viewport.height())
+
+    def test_open_report_cancel_or_invalid_file_preserves_previous_report(self):
+        previous = Report("previous-phone", [], status="complete")
+        self.window.show_report(previous)
+        self.app.processEvents()
+        with patch("android_backup.gui.QFileDialog.getOpenFileName", return_value=("", "")):
+            self.window.open_report.click()
+        self.assertIs(self.window.report, previous)
+        path = Path(self.settings_directory.name) / "invalid.json"
+        path.write_text("Kein JSON-Bericht", encoding="utf-8")
+        with patch("android_backup.gui.QFileDialog.getOpenFileName", return_value=(str(path), "")):
+            self.window.open_report.click()
+        self.assertIs(self.window.report, previous)
+        self.assertTrue(self.window.banner.isVisible())
+        self.assertIn("Bericht konnte nicht gelesen werden", self.window.banner.message.text())
+
+
+class GuiHarnessTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        GuiTests.setUpClass()
+
+    def test_callback_exceptions_fail_the_test_and_restore_exception_hook(self):
+        for error in (AssertionError, RuntimeError):
+            with self.subTest(error=error):
+                class CallbackFailure(GuiTests):
+                    def runTest(self):
+                        def received(result):
+                            raise error("Callback failure probe")
+
+                        self.window.launch(lambda worker: "done", received)
+                        self.wait(lambda: self.window.worker is None)
+
+                original_hook = sys.excepthook
+                result = unittest.TestResult()
+                CallbackFailure("runTest").run(result)
+                self.assertFalse(result.wasSuccessful())
+                self.assertEqual(len(result.failures), 1)
+                self.assertIn("Callback failure probe", result.failures[0][1])
+                self.assertIs(sys.excepthook, original_hook)
+
+    def test_failed_setup_cleans_window_worker_patches_and_settings(self):
+        class SetupFailure(GuiTests):
+            def setUp(self):
+                super().setUp()
+                self.window.launch(
+                    lambda worker: self.window.cancel_event.wait(5), lambda result: None
+                )
+                self.fail("Setup failure probe")
+
+            def runTest(self):
+                raise AssertionError("Test body must not run")
+
+        from android_backup.core import Adb
+
+        original_scan = Adb.scan
+        original_hook = sys.excepthook
+        case = SetupFailure("runTest")
+        result = unittest.TestResult()
+        case.run(result)
+        self.assertEqual(len(result.failures), 1)
+        self.assertIn("Setup failure probe", result.failures[0][1])
+        self.assertIsNone(case.window.worker)
+        self.assertIsNone(case.window.device_monitor)
+        with self.assertRaises(RuntimeError):
+            case.window.isVisible()
+        self.assertFalse(Path(case.settings_directory.name).exists())
+        self.assertIs(Adb.scan, original_scan)
+        self.assertIs(sys.excepthook, original_hook)
 
 
 if __name__ == "__main__":

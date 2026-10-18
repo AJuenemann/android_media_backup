@@ -84,9 +84,24 @@ Auf diesem Rechner ist der Menüeintrag mit diesem Backup-Icon bereits eingerich
 7. Die Ergebnis-Karte prüfen. Nur „Vollständig im erfassten, zugänglichen Umfang“
    bedeutet, dass alle erfassten Dateien ohne gemeldete Probleme gesichert wurden.
 
+Der Bestätigungsdialog zeigt Umfang, Zielordner, Prüfmodus und Erfassungshinweise
+im gleichen Hell-/Dunkeldesign wie das Dashboard. **Sicherung starten** ist die
+Standardaktion (Enter); **Abbrechen**, Escape oder Schließen startet keine Sicherung.
+Beim Schließen während eines Vorgangs bleibt dagegen **Abbrechen** vorausgewählt,
+damit Enter nicht versehentlich die laufende Sicherung beendet. Qt-Standarddialoge
+werden mit der mitgelieferten deutschen Übersetzung angezeigt.
+
 Das Dashboard ordnet Gerät, Ziel und Vorschau in Karten. Es folgt automatisch dem
 hellen oder dunklen Farbschema des Systems, auch bei einem Wechsel während der
 Laufzeit. Die Oberfläche benötigt keine zusätzlichen Design-Pakete.
+
+Solange kein Vorgang läuft, prüft die Anwendung alle drei Sekunden im Hintergrund
+die ADB-Geräteliste. Nachträglich angeschlossene Geräte sowie eine nachträglich
+bestätigte USB-Debugging-Freigabe werden automatisch erkannt und eingelesen.
+Eine unveränderte Geräteauswahl behält ihre Vorschau; das Abziehen des ausgewählten
+Geräts verwirft sie. Während einer Bestandsaufnahme oder Sicherung pausiert die
+Erkennung. Bei einem Erkennungsfehler erscheint eine Mitteilung; **Geräte suchen**
+startet die Erkennung erneut.
 
 Während einer Gerätesuche, Bestandsaufnahme oder Sicherung wird der Startknopf zu
 **Abbrechen**. Der Fortschrittsbereich zeigt Phase, Dateizähler und Laufzeit.
@@ -107,8 +122,15 @@ eingehängt ist; den Zielordner vor dem Start prüfen.
 Fehler erscheinen als sichtbare Mitteilung statt als blockierender Fehlerdialog.
 Hinweise zu fehlender Gerätefreigabe stehen direkt in der Gerätekarte. Details
 der Bestandsaufnahme sowie das **Technische Protokoll** sind aufklappbar.
+Beim Aufklappen erhält das Protokoll den Tastaturfokus und wird ins Sichtfeld
+gescrollt. Beim Einklappen wird die vorherige Scrollposition wiederhergestellt;
+der Fokus kehrt zum Ergebnisbereich beziehungsweise zur Bestandsaufnahme zurück.
+Während eines laufenden Vorgangs erhält stattdessen der aktive Abbrechen-Button
+den Fokus; ohne verfügbare Aktion bleibt der Protokoll-Schalter erreichbar.
 **Protokoll kopieren** übernimmt den vollständigen Text mit Zeitstempeln in die
-Zwischenablage. **Info** erklärt Umfang, Ausschlüsse und Integritätsprüfung.
+Zwischenablage. **Info** erklärt Umfang, Ausschlüsse und Integritätsprüfung in
+einem Dialog mit den gleichen Karten, Farben und Buttons wie das Dashboard.
+**Schließen**, Enter oder Escape schließen die Information.
 
 Der zuletzt gewählte Backup-Ordner wird benutzerspezifisch gespeichert und beim
 nächsten Start automatisch eingesetzt. Dies gilt auch für manuell eingegebene
@@ -137,8 +159,14 @@ bearbeitete Dateien als getrennte Kennzahlen. Fehler, leere Quelldateien und
 Metadatenwarnungen sind in eigenen aufklappbaren Gruppen aufgelistet.
 Prüfmodus und Anzahl ohne erneute Inhaltsprüfung übersprungener Dateien bleiben
 auch bei eingeklappten Details sichtbar. Farbe wird immer durch einen
-ausgeschriebenen Status ergänzt. **Berichtsordner anzeigen** öffnet den Ordner
-des angezeigten JSON-Berichts im Dateimanager.
+ausgeschriebenen Status ergänzt. **Probleme anzeigen** öffnet eine übersichtliche
+Liste mit Meldung, betroffener Datei beziehungsweise Bereich und Auswirkung.
+Sie unterscheidet fehlgeschlagene oder nicht bearbeitete Dateien, Erfassungsfehler,
+leere Quelldateien und Metadatenwarnungen. Bekannte Warnungen erklären etwa eine
+abweichende Jahresablage, mögliche Farbabweichungen oder unlesbare EXIF-Texte.
+Unbekannte Meldungen bleiben unverändert sichtbar, ohne eine ungesicherte Ursache
+zu behaupten. Auch ohne Probleme lässt sich die Übersicht öffnen; sie bestätigt
+dann ausdrücklich nur den erfassten, zugänglichen Umfang.
 
 Bei ausschließlich solchen Warnungen lautet der Status
 **„Alle ausgewählten Dateien gesichert – mit Warnungen“**, nicht „fehlgeschlagen“.
@@ -149,6 +177,9 @@ Metadaten werden bei Folgeläufen nicht erneut ausgewertet.
 
 Mit **Bericht öffnen** können auch frühere JSON-Abschlussberichte unter
 `.backup` angezeigt werden, ohne die Sicherung zu wiederholen.
+Nach der Auswahl wird die Ergebnis-Karte aktualisiert und ihr Anfang mit Status
+und Berichtspfad ins Sichtfeld gescrollt. Der Bericht erhält den Tastaturfokus,
+auch wenn seine Details höher als das Fenster sind.
 Bei älteren Berichten werden bekannte Metadatenmeldungen zugeordnet;
 unbekannte Meldungen gelten vorsichtshalber als Fehler. Das Öffnen verändert
 weder den Bericht noch die Backup-Dateien.
@@ -342,6 +373,9 @@ nur, wenn das Programm verfügbar ist; sonst werden sie ausdrücklich übersprun
 Die GUI-Tests prüfen auch automatisches Einlesen bei Start und Gerätewechsel,
 erneute Erfassung nach einer Sicherung, Abbruch ohne automatische Wiederholung,
 Inline-Fehler, aufklappbare Ergebnisdetails, Speicherwarnungen und Theme-Wechsel.
+Unbehandelte Ausnahmen in Qt-Rückrufen lassen die Tests fehlschlagen. Testfenster,
+Hintergrundvorgänge und simulierte Abhängigkeiten werden auch bei einem Fehler im
+Testaufbau aufgeräumt. Eigene Tests prüfen diese Fehlererfassung und Aufräumlogik.
 
 Zusätzlich am echten Gerät prüfen: Erkennung des internen Speichers und der
 SD-Karte, Bilder/Videos über einen Jahreswechsel, Messenger-Dateien, gesperrte

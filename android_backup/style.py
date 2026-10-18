@@ -34,7 +34,7 @@ def apply_theme(widget: QWidget, scheme: Qt.ColorScheme) -> None:
     widget.setPalette(palette)
     widget.setProperty("theme", "dark" if dark else "light")
     widget.setStyleSheet(f"""
-        QMainWindow, QScrollArea, QWidget#dashboard {{ background: {background}; }}
+        QMainWindow, QDialog, QScrollArea, QWidget#dashboard {{ background: {background}; }}
         QWidget {{ color: {text}; font-size: 14px; }}
         QFrame[card="true"] {{
             background: {surface}; border: 1px solid {border}; border-radius: 12px;
@@ -65,7 +65,7 @@ def apply_theme(widget: QWidget, scheme: Qt.ColorScheme) -> None:
         QPushButton:disabled {{
             background: {background}; color: {muted}; border-color: {border};
         }}
-        QLineEdit, QComboBox, QPlainTextEdit {{
+        QLineEdit, QComboBox, QPlainTextEdit, QTextBrowser {{
             background: {surface}; border: 1px solid {border}; border-radius: 6px;
             padding: 8px; selection-background-color: {accent};
             selection-color: {accent_text};

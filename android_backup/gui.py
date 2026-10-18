@@ -9,17 +9,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QObject, QSettings, QSignalBlocker, QThread, QTimer, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QCloseEvent, QDesktopServices, QIcon, QResizeEvent
+from PySide6.QtCore import QLibraryInfo, QLocale, QObject, QSettings, QSignalBlocker, QThread, QTimer, QTranslator, Qt, Signal, Slot
+from PySide6.QtGui import QCloseEvent, QIcon, QResizeEvent
 from PySide6.QtWidgets import (
-    QApplication, QBoxLayout, QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea, QStyle,
+    QApplication, QBoxLayout, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+    QMainWindow, QProgressBar, QPushButton, QScrollArea, QStyle,
     QVBoxLayout, QWidget,
 )
 
 from .core import Adb, Backup, BackupError, Cancelled, Device, Inventory, Metadata, Report, checked_command, load_report
 from .style import apply_theme
-from .widgets import Banner, Card, CollapsibleSection, StatTile, label, set_role
+from .widgets import Banner, Card, CollapsibleSection, ConfirmationDialog, InfoDialog, ProblemsDialog, StatTile, label, set_role
 
 
 def readable_size(size: int) -> str:
@@ -62,6 +62,13 @@ class Window(QMainWindow):
         self.setMinimumSize(760, 600)
         self.cancel_event = threading.Event()
         self.worker: Worker | None = None
+        self.device_monitor: Worker | None = None
+        self.monitor_cancel = threading.Event()
+        self.operation_generation = 0
+        self.monitor_generation = 0
+        self.device_timer = QTimer(self)
+        self.device_timer.setInterval(3000)
+        self.device_timer.timeout.connect(self.poll_devices)
         self.result_handler: Callable[[object], None] | None = None
         self.inventory: Inventory | None = None
         self.close_requested = False
@@ -70,7 +77,8 @@ class Window(QMainWindow):
         self.last_feedback = 0.0
         self.phase = ""
         self.pending_scan = False
-        self.report_path = ""
+        self.report: Report | None = None
+        self.log_return_scroll = 0
         self.activity_timer = QTimer(self)
         self.activity_timer.setInterval(1000)
         self.activity_timer.timeout.connect(self.update_activity)
@@ -91,7 +99,7 @@ class Window(QMainWindow):
         header.addWidget(icon)
         titles = QVBoxLayout()
         titles.addWidget(label("Android-Medienbackup", "title"))
-        titles.addWidget(label("Lokal sichern. Vorhandenes behalten.", "muted"))
+        titles.addWidget(label("Fotos, Videos und Dateien direkt auf Ihrem Rechner sichern.", "muted"))
         header.addLayout(titles, 1)
         self.open_report = QPushButton("Bericht &öffnen")
         self.open_report.clicked.connect(self.choose_report)
@@ -219,6 +227,8 @@ class Window(QMainWindow):
         layout.addWidget(self.progress_card)
 
         self.result_card = Card("Ergebnis")
+        self.result_card.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.result_card.setAccessibleName("Angezeigter Sicherungsbericht")
         self.result_status = label("", "heading")
         self.result_card.content.addWidget(self.result_status)
         self.result_context = label("", "muted")
@@ -240,13 +250,14 @@ class Window(QMainWindow):
         self.report_warnings = CollapsibleSection("Metadatenwarnungen (erfolgreich gesichert)")
         for section in (self.report_errors, self.report_empty, self.report_warnings):
             self.result_card.content.addWidget(section)
-        self.report_folder = QPushButton("Berichtsordner anzeigen")
-        self.report_folder.clicked.connect(self.open_report_folder)
-        self.result_card.content.addWidget(self.report_folder)
+        self.report_problems = QPushButton("&Probleme anzeigen")
+        self.report_problems.clicked.connect(self.show_problems)
+        self.result_card.content.addWidget(self.report_problems)
         self.result_card.hide()
         layout.addWidget(self.result_card)
         self.log_section = CollapsibleSection("Technisches Protokoll")
         self.log = self.log_section.details
+        self.log_section.toggle.toggled.connect(self.navigate_log)
         self.log.setAccessibleName("Protokoll und Abschlussbericht")
         copy_log = QPushButton("Protokoll &kopieren")
         copy_log.clicked.connect(self.copy_log)
@@ -285,22 +296,37 @@ class Window(QMainWindow):
         QApplication.clipboard().setText(self.log.toPlainText())
 
     def show_info(self) -> None:
-        QMessageBox.information(
-            self, "Über die Sicherung",
-            "Additive USB-Sicherung: Fotos und Videos nach Jahren, andere Dateien nach Typ.\n\n"
-            "Quelldateien und vorhandene Backups werden nicht gelöscht. "
-            "Technische App-Daten, Cache und Installationsdateien sind ausgeschlossen.\n\n"
-            "Die Auswahl nutzt Android-Kategorien und Download-Ordner und kann von Files by Google abweichen. "
-            "Gesperrte Bereiche werden gemeldet und sind nicht Bestandteil der Sicherung.\n\n"
-            "Schnelllauf: Bekannte Dateien werden nach Größe/Änderungszeit verglichen. "
-            "Für eine erneute Inhaltsprüfung die vollständige Integritätsprüfung wählen."
-        )
+        dialog = InfoDialog(self)
+        dialog.exec()
+        dialog.deleteLater()
 
-    def open_report_folder(self) -> None:
-        if self.report_path:
-            folder = Path(self.report_path).expanduser().absolute().parent
-            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))):
-                self.show_error(f"Berichtsordner konnte nicht geöffnet werden: {folder}")
+    def show_problems(self) -> None:
+        if self.report is not None:
+            dialog = ProblemsDialog(self, self.report)
+            dialog.exec()
+            dialog.deleteLater()
+
+    @Slot(bool)
+    def navigate_log(self, expanded: bool) -> None:
+        if expanded:
+            self.log_return_scroll = self.dashboard_scroll.verticalScrollBar().value()
+        QTimer.singleShot(0, self, self.focus_log_area)
+
+    def focus_log_area(self) -> None:
+        if self.log_section.toggle.isChecked():
+            self.log.setFocus(Qt.FocusReason.OtherFocusReason)
+            self.dashboard_scroll.ensureWidgetVisible(self.log)
+            self.dashboard_scroll.verticalScrollBar().setValue(
+                self.dashboard_scroll.verticalScrollBar().maximum()
+            )
+        else:
+            target = next(
+                widget for widget in (
+                    self.report_problems, self.scan, self.start, self.log_section.toggle
+                ) if widget.isVisible() and widget.isEnabled()
+            )
+            target.setFocus(Qt.FocusReason.OtherFocusReason)
+            self.dashboard_scroll.verticalScrollBar().setValue(self.log_return_scroll)
 
     def primary_action(self) -> None:
         if self.worker is not None:
@@ -315,6 +341,10 @@ class Window(QMainWindow):
         selected = self.devices.currentData()
         authorized = selected is not None and selected.state == "device"
         self.scan.setEnabled(not busy and authorized)
+        self.scan.setText(
+            "Bestand wird eingelesen …" if busy and self.phase == "Bestand einlesen"
+            else "Bestand &neu einlesen"
+        )
         self.start.setText("&Abbrechen" if busy else "Sicherung s&tarten")
         set_role(self.start, "variant", "danger" if busy else "primary")
         self.start.setEnabled(
@@ -333,6 +363,7 @@ class Window(QMainWindow):
     ) -> None:
         if self.worker is not None:
             return
+        self.operation_generation += 1
         self.cancel_event.clear()
         self.phase = phase
         self.phase_label.setText(phase)
@@ -441,6 +472,7 @@ class Window(QMainWindow):
     def refresh_devices(self) -> None:
         if self.worker is not None:
             return
+        self.device_timer.stop()
         self.pending_scan = False
         self.inventory = None
         with QSignalBlocker(self.devices):
@@ -458,18 +490,8 @@ class Window(QMainWindow):
             return Adb.devices(self.cancel_event)
 
         def received(result: object) -> None:
-            if not isinstance(result, list):
-                raise TypeError("Expected device list")
-            with QSignalBlocker(self.devices):
-                self.devices.clear()
-                for device in result:
-                    if not isinstance(device, Device):
-                        raise TypeError("Expected device")
-                    self.devices.addItem(f"{device.model} — {device.serial} [{device.state}]", device)
-                for index in range(self.devices.count()):
-                    if self.devices.itemData(index).state == "device":
-                        self.devices.setCurrentIndex(index)
-                        break
+            self.populate_devices(result)
+            self.device_timer.start()
             if not self.devices.count():
                 self.append_log("Kein Gerät gefunden. USB-Verbindung und USB-Debugging prüfen.")
             elif not any(self.devices.itemData(i).state == "device" for i in range(self.devices.count())):
@@ -481,6 +503,68 @@ class Window(QMainWindow):
             self.pending_scan = device is not None and device.state == "device"
 
         self.launch(action, received, "Geräte suchen")
+
+    def populate_devices(self, result: object) -> None:
+        if not isinstance(result, list) or not all(isinstance(device, Device) for device in result):
+            raise TypeError("Expected device list")
+        selected = self.devices.currentData()
+        with QSignalBlocker(self.devices):
+            self.devices.clear()
+            for device in result:
+                self.devices.addItem(f"{device.model} — {device.serial} [{device.state}]", device)
+            ready = [i for i, device in enumerate(result) if device.state == "device"]
+            index = next(
+                (i for i in ready if selected is not None and result[i].serial == selected.serial),
+                ready[0] if ready else (0 if result else -1),
+            )
+            self.devices.setCurrentIndex(index)
+
+    def poll_devices(self) -> None:
+        if self.worker is not None or self.device_monitor is not None or self.close_requested:
+            return
+        self.monitor_cancel.clear()
+        self.monitor_generation = self.operation_generation
+        self.device_monitor = Worker(lambda worker: Adb.devices(self.monitor_cancel), self)
+        self.device_monitor.result.connect(self.receive_device_update)
+        self.device_monitor.error.connect(self.device_monitor_error)
+        self.device_monitor.finished.connect(self.device_monitor_finished)
+        self.device_monitor.start()
+
+    @Slot(object)
+    def receive_device_update(self, result: object) -> None:
+        if self.close_requested or self.worker is not None or self.monitor_generation != self.operation_generation:
+            return
+        if not isinstance(result, list) or not all(isinstance(device, Device) for device in result):
+            raise TypeError("Expected device list")
+        previous = [self.devices.itemData(i) for i in range(self.devices.count())]
+        if result == previous:
+            return
+        selected = self.devices.currentData()
+        self.populate_devices(result)
+        self.update_device_status()
+        self.append_log("Geräteliste automatisch aktualisiert.")
+        if selected != self.devices.currentData():
+            self.invalidate_inventory()
+
+    @Slot(str)
+    def device_monitor_error(self, message: str) -> None:
+        if self.close_requested or self.worker is not None or self.monitor_generation != self.operation_generation:
+            return
+        self.device_timer.stop()
+        self.inventory = None
+        self.show_error(
+            "Automatische Geräteerkennung fehlgeschlagen: " + message
+            + " · Zum Wiederholen „Geräte suchen“ wählen."
+        )
+        self.update_preview()
+
+    @Slot()
+    def device_monitor_finished(self) -> None:
+        monitor = self.device_monitor
+        if monitor is not None:
+            monitor.wait()
+            self.device_monitor = None
+            monitor.deleteLater()
 
     def invalidate_inventory(self) -> None:
         self.inventory = None
@@ -636,15 +720,22 @@ class Window(QMainWindow):
         if target == Path(target.anchor) or target == Path.home():
             self.show_error("Bitte einen eigenen Backup-Unterordner statt Wurzel- oder Home-Verzeichnis wählen.")
             return
-        answer = QMessageBox.question(
+        self.operation_generation += 1
+        dialog = ConfirmationDialog(
             self, "Sicherung starten",
-            f"{len(inventory.files):,} Dateien · {readable_size(inventory.total_bytes)}\n"
-            f"Ziel: {target}\n"
-            f"Prüfmodus: {mode}\n"
-            f"Hinweise aus der Erfassung: {len(inventory.issues)}\n\n"
+            [
+                ("Umfang", f"{len(inventory.files):,} Dateien · {readable_size(inventory.total_bytes)}"),
+                ("Zielordner", str(target)),
+                ("Prüfmodus", mode),
+                ("Hinweise zur Bestandsaufnahme", str(len(inventory.issues))),
+            ],
             "Vorhandene Inhalte bleiben erhalten. Gesperrte Bereiche sind nicht Bestandteil der Sicherung.",
+            "Sicherung &starten",
         )
-        if answer != QMessageBox.StandardButton.Yes:
+        with QSignalBlocker(self.device_timer):
+            answer = dialog.exec()
+        dialog.deleteLater()
+        if answer != QDialog.DialogCode.Accepted:
             return
         self.append_log(f"Sicherung gestartet: {target}")
         self.result_card.hide()
@@ -722,10 +813,9 @@ class Window(QMainWindow):
                 for name, warnings in report.metadata_warnings.items()
             ), messages
         )
-        self.report_path = report.report_path
-        self.report_folder.setEnabled(bool(self.report_path))
+        self.report = report
         self.result_card.show()
-        QTimer.singleShot(0, lambda: self.dashboard_scroll.ensureWidgetVisible(self.result_card))
+        QTimer.singleShot(0, self, self.reveal_report)
         self.current.setText(outcome)
         self.append_log(
             f"\n{outcome}\n"
@@ -763,6 +853,15 @@ class Window(QMainWindow):
                 )
             )
 
+    def reveal_report(self) -> None:
+        body = self.dashboard_scroll.widget()
+        if body is not None:
+            layout = body.layout()
+            if layout is not None:
+                layout.activate()
+        self.result_card.setFocus(Qt.FocusReason.OtherFocusReason)
+        self.dashboard_scroll.verticalScrollBar().setValue(max(0, self.result_card.y() - 14))
+
     def cancel(self) -> None:
         self.pending_scan = False
         self.cancel_event.set()
@@ -771,20 +870,36 @@ class Window(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self.worker is not None:
-            answer = QMessageBox.question(
-                self, "Vorgang läuft", "Vorgang abbrechen und nach sicherem Abschluss schließen?"
+            dialog = ConfirmationDialog(
+                self, "Vorgang läuft", [("Aktueller Vorgang", self.phase)],
+                "Vorgang abbrechen und nach sicherem Abschluss schließen? "
+                "Eine abgebrochene Sicherung ist nicht vollständig.",
+                "Vorgang &abbrechen und schließen", default_accept=False,
             )
-            if answer == QMessageBox.StandardButton.Yes:
+            answer = dialog.exec()
+            dialog.deleteLater()
+            if answer == QDialog.DialogCode.Accepted:
                 self.close_requested = True
                 self.cancel()
             event.ignore()
         else:
+            self.close_requested = True
+            self.device_timer.stop()
+            self.monitor_cancel.set()
+            self.device_monitor_finished()
             self.save_target()
             event.accept()
 
 
 def main() -> None:
     app = QApplication(sys.argv)
+    QLocale.setDefault(QLocale("de_DE"))
+    translator = QTranslator(app)
+    if not translator.load(
+        "qtbase_de", QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)
+    ):
+        raise RuntimeError("Die deutsche Qt-Übersetzung konnte nicht geladen werden.")
+    app.installTranslator(translator)
     app.setStyle("Fusion")
     app.setApplicationName("Android-Medienbackup")
     app.setDesktopFileName("android-media-backup")
