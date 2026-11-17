@@ -8,68 +8,44 @@ Durchsuchung aller App-Ordner. Sie kann von Files by Google abweichen.
 
 ## Installation
 
-Benötigt werden Linux mit glibc, Python ab 3.11, Android Platform Tools (`adb`)
-und ExifTool. Unter Ubuntu/Debian:
+Das Paket unterstützt Ubuntu 24.04 oder neuer sowie Linux Mint 22 oder neuer
+auf amd64. Der Build-Rechner benötigt `dpkg-deb`, `desktop-file-utils` und
+Python 3.11+. Fehlende Werkzeuge lassen sich mit
+`sudo apt install desktop-file-utils` installieren.
 
-```sh
-sudo apt install adb libimage-exiftool-perl python3-venv
-```
+1. Das Projekt auf dem Build-Rechner entpacken und im Projektverzeichnis
+   ausführen:
 
-Im Projektverzeichnis:
+   ```sh
+   bash build-deb.sh
+   ```
 
-```sh
-python3 -m venv ~/.local/share/android-media-backup/venv
-~/.local/share/android-media-backup/venv/bin/python -m pip install -e .
-~/.local/share/android-media-backup/venv/bin/android-backup
-```
+Das fertige Paket liegt unter `dist/android-media-backup_<Version>_amd64.deb`.
+Auf einen USB-Datenträger kopieren und auf dem Zielrechner installieren:
 
-Die Python-Umgebung liegt bewusst auf dem Linux-Dateisystem, nicht auf dem
-Projekt- oder Backup-Datenträger: FAT/exFAT unterstützen die für virtuelle
-Umgebungen benötigten symbolischen Links nicht. PySide6-Essentials enthält
-die benötigten Qt-Widgets; WebEngine und weitere Qt-Addons sind nicht erforderlich.
+   ```sh
+   sudo apt install ./android-media-backup_<Version>_amd64.deb
+   ```
 
-Alternativer Start mit derselben Python-Umgebung: `python -m android_backup`.
-Falls Qt unter X11 fehlende Bibliotheken meldet, müssen die von Qt genannten
-Systembibliotheken installiert werden (unter Ubuntu häufig `libxcb-cursor0`).
-Die Anwendung verwendet eine native Qt-Oberfläche, keinen Browser.
+`apt` lädt fehlende **Systemabhängigkeiten** wie Python, ADB, ExifTool und
+Qt/XCB-Laufzeitbibliotheken aus den konfigurierten APT-Repositories. Während
+der Paketinstallation erstellt ein Post-Installationsskript eine private
+Python-Umgebung und lädt PySide6 samt Python-Abhängigkeiten von PyPI.
+Anwendungscode, Desktop-Eintrag und Icon stecken im `.deb`; auf dem Zielrechner
+sind weder GitHub noch ein manueller PyPI-Aufruf nötig. Der Zielrechner braucht
+Internetzugriff sowohl auf APT-Repositories als auch auf PyPI.
+
+Zum Aktualisieren das neue `.deb` auf den Zielrechner kopieren und denselben
+`apt install ./paket.deb`-Befehl erneut ausführen. Backups und
+Benutzereinstellungen bleiben erhalten. Die App wird nicht als Administrator
+ausgeführt.
 
 ## Start über das Anwendungsmenü
 
-Auf diesem Rechner ist **Android-Medienbackup** im Anwendungsmenü eingerichtet.
 Die Anwendungssuche öffnen (unter GNOME mit der Super-/Windows-Taste),
 „Android-Medienbackup“ eingeben und die App starten. Ein Terminal ist dafür
-nicht erforderlich. Über das Kontextmenü kann die App auch als Favorit
-an die Dock-/Taskleiste angeheftet werden.
-
-Der benutzerspezifische Starter liegt unter
-`~/.local/share/applications/android-media-backup.desktop` und verwendet
-die oben eingerichtete Python-Umgebung. Da die Installation mit `pip install -e .`
-erfolgt, muss auch das Projektverzeichnis weiterhin verfügbar sein.
-
-### Menüeintrag und Backup-Icon einrichten
-
-Die Vorlage `android-media-backup.desktop` ist im Projekt enthalten.
-Das eigene Icon `android_backup/backup.svg` zeigt ein Smartphone, einen
-Sicherungspfeil und ein Archiv. Es wird im Anwendungsmenü und im App-Fenster
-verwendet; die Desktop-Zuordnung verbindet das Fenster mit dem Menüeintrag.
-
-Nach der Python-Installation folgende Befehle **im Projektverzeichnis**
-ausführen, um den Menüeintrag für den aktuellen Benutzer einzurichten:
-
-```sh
-data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
-install -Dm644 android_backup/backup.svg \
-  "$data_home/icons/hicolor/scalable/apps/android-media-backup.svg"
-mkdir -p "$data_home/applications"
-sed "s|^Exec=.*|Exec=\"$HOME/.local/share/android-media-backup/venv/bin/android-backup\"|" \
-  android-media-backup.desktop > "$data_home/applications/android-media-backup.desktop"
-update-desktop-database "$data_home/applications"
-```
-
-`update-desktop-database` gehört unter Ubuntu zum Paket `desktop-file-utils`.
-Nach einer Icon-Änderung die App schließen und neu starten. Wenn das Dock noch
-das alte Icon zwischenspeichert, den Favoriten entfernen und erneut hinzufügen.
-Auf diesem Rechner ist der Menüeintrag mit diesem Backup-Icon bereits eingerichtet.
+nicht erforderlich. Über das Kontextmenü kann die App als Favorit an die
+Dock-/Taskleiste angeheftet werden.
 
 ## Bedienung
 
@@ -392,10 +368,11 @@ sind auf FAT/exFAT nicht darstellbar; solche Dateifehler werden im Bericht genan
 
 ## Tests
 
-Mit der installierten Python-Umgebung im Projektverzeichnis:
+Im Projektverzeichnis (nach Installation des Pakets und der PySide6-Laufzeit):
 
 ```sh
-~/.local/share/android-media-backup/venv/bin/python -m unittest discover -v
+PYTHONPATH=/usr/lib/android-media-backup \
+  /opt/android-media-backup/venv/bin/python -m unittest discover -v
 ```
 
 Die Tests prüfen Ablage, Dubletten, Inhaltsversionen, Namenskonflikte,
